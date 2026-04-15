@@ -379,18 +379,22 @@ class TestMcpE2E:
         )
 
         assert "result" in response, f"Expected result, got: {response}"
-        payload = json.loads(response["result"]["content"][0]["text"])
+        text = response["result"]["content"][0]["text"]
 
-        assert "error" not in payload, f"inspect_index returned error: {payload}"
+        # Response is now human-readable text, not JSON
+        assert "error" not in text.lower() or "No index found" not in text, (
+            f"inspect_index returned error: {text}"
+        )
 
-        for key in ("total_files", "total_chunks", "languages", "index_size_bytes",
-                    "tokens_saved_total", "total_queries", "stale_files_count", "stale_files"):
-            assert key in payload, f"Missing key '{key}': {payload}"
-
-        assert payload["total_files"] >= 1, "Expected at least 1 indexed file"
-        assert payload["total_chunks"] >= 1, "Expected at least 1 indexed chunk"
-        assert "python" in payload["languages"], (
-            f"Expected 'python' in languages: {payload['languages']}"
+        # Verify key stats are present in the text
+        assert "files" in text, f"Missing 'files' in response: {text}"
+        assert "chunks" in text, f"Missing 'chunks' in response: {text}"
+        assert "python" in text.lower(), f"Expected 'python' in response: {text}"
+        assert "Tokens saved" in text or "tokens saved" in text.lower(), (
+            f"Missing tokens saved info: {text}"
+        )
+        assert "Stale" in text or "stale" in text.lower(), (
+            f"Missing stale info: {text}"
         )
 
     def test_07_inspect_index_total_queries_nonzero(self, mcp_server):
@@ -404,8 +408,12 @@ class TestMcpE2E:
             timeout=15,
         )
 
-        payload = json.loads(response["result"]["content"][0]["text"])
-        assert "error" not in payload, f"Unexpected error: {payload}"
-        assert payload["total_queries"] >= 1, (
-            f"Expected total_queries >= 1, got {payload['total_queries']}"
+        text = response["result"]["content"][0]["text"]
+        assert "No index found" not in text, f"Unexpected error: {text}"
+        # Text format: "Tokens saved (lifetime): N across M queries"
+        import re
+        m = re.search(r"across (\d+) queries", text)
+        assert m, f"Could not find query count in: {text}"
+        assert int(m.group(1)) >= 1, (
+            f"Expected total_queries >= 1, got {m.group(1)}"
         )

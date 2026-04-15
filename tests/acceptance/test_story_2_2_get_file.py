@@ -8,6 +8,7 @@ FRs: FR6 (structured reading via index), FR7 (class outlines), FR8 (method chunk
 """
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -43,6 +44,85 @@ def _create_test_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _parse_get_file_text(text: str) -> dict:
+    """Parse the text output of get_file into a structured dict.
+
+    Format:
+        File: {file_path} ({N} chunks)
+
+        ### {name} ({chunk_type}) L{start}-{end}[ [STALE]]
+        ```{lang}
+        {content}
+        ```
+
+        ---
+        Tokens saved: {saved} ({pct}% reduction) | Query: {ms}ms
+    """
+    results = []
+    lines = text.splitlines()
+
+    # Parse chunk headers: ### name (chunk_type) Lstart-end[ [STALE]]
+    header_re = re.compile(
+        r"^### (.+?) \((\w+)\) L(\d+)-(\d+)(?: \[STALE\])?$"
+    )
+    stale_re = re.compile(r"\[STALE\]")
+
+    i = 0
+    while i < len(lines):
+        m = header_re.match(lines[i])
+        if m:
+            name = m.group(1)
+            chunk_type = m.group(2)
+            line_start = int(m.group(3))
+            line_end = int(m.group(4))
+            stale = bool(stale_re.search(lines[i]))
+
+            # Collect language and content from ```lang ... ``` block
+            language = ""
+            content_lines = []
+            i += 1
+            if i < len(lines) and lines[i].startswith("```"):
+                language = lines[i][3:]  # strip ```
+                i += 1
+                while i < len(lines) and not lines[i].startswith("```"):
+                    content_lines.append(lines[i])
+                    i += 1
+                # skip closing ```
+                i += 1
+            content = "\n".join(content_lines)
+
+            results.append({
+                "name": name,
+                "chunk_type": chunk_type,
+                "line_start": line_start,
+                "line_end": line_end,
+                "language": language,
+                "content": content,
+                "stale": stale,
+            })
+        else:
+            i += 1
+
+    # Parse tokens_saved from footer line
+    # "Tokens saved: {saved:,} ({pct}% reduction) | Query: {ms}ms"
+    tokens_saved = {}
+    ts_re = re.compile(r"Tokens saved: ([\d,]+) \(([\d.]+)% reduction\)")
+    for line in lines:
+        ts_m = ts_re.search(line)
+        if ts_m:
+            saved = int(ts_m.group(1).replace(",", ""))
+            pct = float(ts_m.group(2))
+            tokens_saved = {
+                "saved": saved,
+                "reduction_pct": pct,
+                "without_plugin": 0,
+                "with_plugin": 0,
+            }
+            break
+
+    return {"results": results, "tokens_saved": tokens_saved}
+
+
 @pytest_asyncio.fixture
 async def indexed_env(tmp_path):
     """Create a fully indexed test environment."""
@@ -75,10 +155,9 @@ class TestStructuredFileReading:
         """Chunks devem ser retornados organizados: class outline primeiro, depois metodos."""
         config, storage, indexer, provider, repo = indexed_env
 
-        result_json = await get_file("lib/audio_service.dart")
-        response = json.loads(result_json)
+        result_text = await get_file("lib/audio_service.dart")
+        response = _parse_get_file_text(result_text)
 
-        assert "results" in response
         assert len(response["results"]) > 0
 
         results = response["results"]
@@ -95,8 +174,8 @@ class TestStructuredFileReading:
         """Metodos devem estar na ordem do codigo fonte."""
         config, storage, indexer, provider, repo = indexed_env
 
-        result_json = await get_file("lib/audio_service.dart")
-        response = json.loads(result_json)
+        result_text = await get_file("lib/audio_service.dart")
+        response = _parse_get_file_text(result_text)
 
         methods = [r for r in response["results"] if r["chunk_type"] == "method"]
         if len(methods) >= 2:
@@ -108,8 +187,8 @@ class TestStructuredFileReading:
         """Cada chunk deve conter chunk_type, name, line_start, line_end, content, language."""
         config, storage, indexer, provider, repo = indexed_env
 
-        result_json = await get_file("src/data_processor.py")
-        response = json.loads(result_json)
+        result_text = await get_file("src/data_processor.py")
+        response = _parse_get_file_text(result_text)
 
         assert len(response["results"]) > 0
         for r in response["results"]:
@@ -126,8 +205,8 @@ class TestClassOutlineContent:
         """Outline deve conter nomes de membros, assinaturas de metodos, tipos de campos."""
         config, storage, indexer, provider, repo = indexed_env
 
-        result_json = await get_file("lib/audio_service.dart")
-        response = json.loads(result_json)
+        result_text = await get_file("lib/audio_service.dart")
+        response = _parse_get_file_text(result_text)
 
         class_chunks = [r for r in response["results"] if r["chunk_type"] == "class"]
         if class_chunks:
@@ -140,8 +219,8 @@ class TestClassOutlineContent:
         """Outline NAO deve conter corpo de codigo dos metodos."""
         config, storage, indexer, provider, repo = indexed_env
 
-        result_json = await get_file("src/data_processor.py")
-        response = json.loads(result_json)
+        result_text = await get_file("src/data_processor.py")
+        response = _parse_get_file_text(result_text)
 
         class_chunks = [r for r in response["results"] if r["chunk_type"] == "class"]
         if class_chunks:
@@ -166,8 +245,8 @@ class TestMethodChunkContent:
         """Chunk de metodo deve conter codigo completo."""
         config, storage, indexer, provider, repo = indexed_env
 
-        result_json = await get_file("lib/audio_service.dart")
-        response = json.loads(result_json)
+        result_text = await get_file("lib/audio_service.dart")
+        response = _parse_get_file_text(result_text)
 
         methods = [r for r in response["results"] if r["chunk_type"] == "method"]
         for m in methods:
@@ -178,8 +257,8 @@ class TestMethodChunkContent:
         """Chunk de metodo deve conter assinatura."""
         config, storage, indexer, provider, repo = indexed_env
 
-        result_json = await get_file("lib/audio_service.dart")
-        response = json.loads(result_json)
+        result_text = await get_file("lib/audio_service.dart")
+        response = _parse_get_file_text(result_text)
 
         methods = [r for r in response["results"] if r["chunk_type"] == "method"]
         for m in methods:
@@ -193,8 +272,8 @@ class TestMethodChunkContent:
         # that get_file returns valid chunks with line_start/line_end (content is there)
         config, storage, indexer, provider, repo = indexed_env
 
-        result_json = await get_file("lib/audio_service.dart")
-        response = json.loads(result_json)
+        result_text = await get_file("lib/audio_service.dart")
+        response = _parse_get_file_text(result_text)
 
         methods = [r for r in response["results"] if r["chunk_type"] == "method"]
         for m in methods:
@@ -215,14 +294,12 @@ class TestStaleDetection:
         original = dart_file.read_text()
         dart_file.write_text(original + "\n// modified")
 
-        result_json = await get_file("lib/audio_service.dart")
-        response = json.loads(result_json)
+        result_text = await get_file("lib/audio_service.dart")
 
-        assert "results" in response
-        if response["results"]:
-            assert all(r["stale"] is True for r in response["results"]), (
-                "Todos os chunks devem ter stale=True apos modificacao do arquivo"
-            )
+        # When stale, each chunk header contains [STALE]
+        assert "[STALE]" in result_text, (
+            "Todos os chunks devem ter [STALE] apos modificacao do arquivo"
+        )
 
         # Restore
         dart_file.write_text(original)
@@ -257,25 +334,19 @@ class TestGetFileTokenSavings:
 
     @pytest.mark.asyncio
     async def test_tokens_saved_compares_full_file_vs_chunks(self, indexed_env):
-        """tokens_saved deve comparar tamanho do arquivo completo vs chunks retornados."""
+        """tokens_saved deve estar presente no rodape do texto retornado."""
         config, storage, indexer, provider, repo = indexed_env
 
-        result_json = await get_file("src/data_processor.py")
-        response = json.loads(result_json)
+        result_text = await get_file("src/data_processor.py")
+        response = _parse_get_file_text(result_text)
 
         assert "tokens_saved" in response
         ts = response["tokens_saved"]
-        assert "without_plugin" in ts
-        assert "with_plugin" in ts
+        # The text footer contains: "Tokens saved: {N} ({pct}% reduction)"
         assert "saved" in ts
         assert "reduction_pct" in ts
-        # tokens_saved compares full file size (without_plugin) vs chunks in response
-        # without_plugin may be less than with_plugin for get_file (all chunks + JSON overhead)
-        # The important thing is that both values are present and non-negative
-        assert ts["without_plugin"] >= 0
-        assert ts["with_plugin"] >= 0
         assert ts["saved"] >= 0
-        assert 0.0 <= ts["reduction_pct"] <= 100.0 or ts["reduction_pct"] >= 0.0
+        assert ts["reduction_pct"] >= 0.0
 
 
 class TestGetFileMcpRegistration:

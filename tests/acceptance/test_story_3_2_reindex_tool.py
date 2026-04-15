@@ -96,7 +96,7 @@ class TestReindexToolForce:
 
     @pytest.mark.asyncio
     async def test_force_reindex_returns_rebuilt_status(self, tmp_path, repo_path):
-        """Resposta do server tool deve incluir metadata.index_status: 'rebuilt'."""
+        """Resposta do server tool deve indicar 'rebuilt' no texto."""
         # Test via server tool handler directly
         import src.server as server_module
 
@@ -124,11 +124,13 @@ class TestReindexToolForce:
             await indexer.reindex()
 
             # Call server reindex tool with force=True
-            result_json = await server_module.reindex(force=True)
-            result = json.loads(result_json)
+            result_text = await server_module.reindex(force=True)
 
-            assert "metadata" in result
-            assert result["metadata"]["index_status"] == "rebuilt"
+            # reindex now returns readable text, e.g.:
+            # "Reindex complete (rebuilt): N files scanned, ..."
+            assert "rebuilt" in result_text, (
+                f"Expected 'rebuilt' in reindex text response, got: {result_text!r}"
+            )
         finally:
             server_module._config = None
             server_module._storage = None

@@ -270,17 +270,19 @@ async def reindex(force: bool = False) -> str:
             stats["duration_ms"],
         )
 
-        return json.dumps({
-            "files_scanned": stats["files_scanned"],
-            "files_updated": stats.get("files_updated", 0),
-            "files_deleted": stats.get("files_deleted", 0),
-            "files_added": stats.get("files_added", 0),
-            "chunks_created": stats["chunks_created"],
-            "duration_ms": stats["duration_ms"],
-            "metadata": {
-                "index_status": index_status,
-            },
-        })
+        scanned = stats["files_scanned"]
+        updated = stats.get("files_updated", 0)
+        added = stats.get("files_added", 0)
+        deleted = stats.get("files_deleted", 0)
+        chunks = stats["chunks_created"]
+        duration = stats["duration_ms"]
+        secs = duration / 1000
+
+        return (
+            f"Reindex complete ({index_status}): "
+            f"{scanned} files scanned, {added} added, {updated} updated, {deleted} deleted. "
+            f"{chunks} chunks created in {secs:.1f}s."
+        )
 
     except CTSError as e:
         return json.dumps({
@@ -419,7 +421,10 @@ async def inspect_index(file_path: str | None = None) -> str:
                     "line_end": c.get("line_end", 0),
                     "stale": stale,
                 })
-            return json.dumps({"file_path": file_path, "chunks": result_chunks})
+            lines = [f"File: {file_path} ({'STALE' if stale else 'up-to-date'})"]
+            for c in result_chunks:
+                lines.append(f"  {c['chunk_type']:10s} {c['name']:30s} L{c['line_start']}-{c['line_end']}")
+            return "\n".join(lines)
 
         # Global stats mode
         all_meta = storage.get_all_chunks_metadata()
@@ -467,16 +472,20 @@ async def inspect_index(file_path: str | None = None) -> str:
             total_chunks,
             len(stale_files),
         )
-        return json.dumps({
-            "total_files": total_files,
-            "total_chunks": total_chunks,
-            "languages": lang_counts,
-            "index_size_bytes": index_size_bytes,
-            "tokens_saved_total": tokens_saved_total,
-            "total_queries": total_queries,
-            "stale_files_count": len(stale_files),
-            "stale_files": stale_files,
-        })
+        size_mb = index_size_bytes / (1024 * 1024)
+        langs = ", ".join(f"{lang}: {cnt}" for lang, cnt in sorted(lang_counts.items()))
+        lines = [
+            f"Index: {total_files} files, {total_chunks} chunks ({size_mb:.1f}MB)",
+            f"Languages: {langs}",
+            f"Tokens saved (lifetime): {tokens_saved_total:,} across {total_queries} queries",
+            f"Stale files: {len(stale_files)}",
+        ]
+        if stale_files:
+            for sf in stale_files[:10]:
+                lines.append(f"  - {sf}")
+            if len(stale_files) > 10:
+                lines.append(f"  ... and {len(stale_files) - 10} more")
+        return "\n".join(lines)
 
     except CTSError as e:
         return json.dumps({
@@ -587,17 +596,35 @@ async def get_file(file_path: str) -> str:
         query_time_ms = int((time.perf_counter() - start) * 1000)
         logger.info("get_file: path=%r, chunks=%d, time=%dms", file_path, len(results), query_time_ms)
 
-        response = {
-            "results": results,
-            "tokens_saved": tokens_saved,
-            "metadata": {
-                "query_time_ms": query_time_ms,
-                "index_status": index_status,
-                "notice": _idx.get("notice"),
-            },
-        }
+        # Format as readable text
+        lines = [f"File: {file_path} ({len(results)} chunks)"]
+        for r in results:
+            name = r.get("name", "")
+            chunk_type = r.get("chunk_type", "")
+            line_start = r.get("line_start", 0)
+            line_end = r.get("line_end", 0)
+            lang = r.get("language", "")
+            content = r.get("content", "")
+            stale = r.get("stale", False)
+            stale_tag = " [STALE]" if stale else ""
 
-        return json.dumps(response, ensure_ascii=False)
+            lines.append(f"\n### {name} ({chunk_type}) L{line_start}-{line_end}{stale_tag}")
+            content_lines = content.split("\n")
+            if len(content_lines) > 20:
+                lines.append(f"```{lang}")
+                lines.append("\n".join(content_lines[:20]))
+                lines.append(f"... ({len(content_lines) - 20} more lines)")
+                lines.append("```")
+            else:
+                lines.append(f"```{lang}")
+                lines.append(content)
+                lines.append("```")
+
+        saved = tokens_saved.get("saved", 0)
+        pct = tokens_saved.get("reduction_pct", 0)
+        lines.append(f"\n---\nTokens saved: {saved:,} ({pct}% reduction) | Query: {query_time_ms}ms")
+
+        return "\n".join(lines)
 
     except CTSError as e:
         return json.dumps({
@@ -827,24 +854,28 @@ async def audit_search(query: str, top_k: int = 10) -> str:
             query_time_ms,
         )
 
-        response = {
-            "semantic_only": semantic_only,
-            "grep_only": grep_only,
-            "both": both,
-            "counts": {
-                "semantic_only": len(semantic_only),
-                "grep_only": len(grep_only),
-                "both": len(both),
-            },
-            "tokens_saved": tokens_saved,
-            "metadata": {
-                "query_time_ms": query_time_ms,
-                "index_status": index_status,
-                "notice": _idx.get("notice"),
-            },
-        }
+        def _fmt_items(items, label):
+            if not items:
+                return [f"{label}: (none)"]
+            out = [f"{label} ({len(items)}):"]
+            for item in items:
+                out.append(f"  - {item.get('name', '?')} ({item.get('chunk_type', '?')}) — {item.get('file_path', '')}:{item.get('line_start', 0)}")
+            return out
 
-        return json.dumps(response, ensure_ascii=False)
+        saved = tokens_saved.get("saved", 0)
+        pct = tokens_saved.get("reduction_pct", 0)
+
+        lines = [
+            f"Audit: semantic vs grep for query",
+            f"Both ({len(both)}) | Semantic only ({len(semantic_only)}) | Grep only ({len(grep_only)})",
+            "",
+        ]
+        lines.extend(_fmt_items(both, "Found by both"))
+        lines.extend(_fmt_items(semantic_only, "Semantic only (missed by grep)"))
+        lines.extend(_fmt_items(grep_only, "Grep only (missed by semantic)"))
+        lines.append(f"\nTokens saved: {saved:,} ({pct}% reduction) | Query: {query_time_ms}ms")
+
+        return "\n".join(lines)
 
     except CTSError as e:
         return json.dumps({

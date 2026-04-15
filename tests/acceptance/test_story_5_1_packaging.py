@@ -77,8 +77,8 @@ class TestMcpJson:
         """MCP server deve usar comando uv apontando para src.server."""
         assert "mcpServers" in mcp_json
         servers = mcp_json["mcpServers"]
-        assert "claude-token-saver" in servers
-        server = servers["claude-token-saver"]
+        assert "cts" in servers
+        server = servers["cts"]
         assert server["command"] == "uv", "MCP server deve usar comando uv"
         args = server.get("args", [])
         assert any("src.server" in arg for arg in args), (
@@ -88,7 +88,7 @@ class TestMcpJson:
     def test_mcp_json_uses_plugin_root_env(self, mcp_json):
         """Deve usar ${CLAUDE_PLUGIN_ROOT} para --directory e CTS_REPO_PATH=${PWD}."""
         servers = mcp_json["mcpServers"]
-        server = servers["claude-token-saver"]
+        server = servers["cts"]
         args_str = " ".join(server.get("args", []))
         env = server.get("env", {})
         assert "CLAUDE_PLUGIN_ROOT" in args_str, (
