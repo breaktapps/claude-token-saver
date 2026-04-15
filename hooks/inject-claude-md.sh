@@ -8,11 +8,12 @@ set -euo pipefail
 
 MARKER_START="<!-- claude-token-saver-start -->"
 MARKER_END="<!-- claude-token-saver-end -->"
+OLD_MARKER="<!-- claude-token-saver -->"
 REPO_PATH="${CTS_REPO_PATH:-${PWD}}"
 CLAUDE_MD="$REPO_PATH/CLAUDE.md"
 
 # The section content (bump this when plugin updates change behavior)
-SECTION_VERSION="0.1.2"
+SECTION_VERSION="0.1.3"
 SECTION="$MARKER_START
 ## Code Search (claude-token-saver plugin v${SECTION_VERSION})
 
@@ -33,6 +34,26 @@ This project has the claude-token-saver plugin installed. **Always prefer plugin
 - **ALWAYS show token savings** after each search: \"Tokens saved: X (Y%) | Session total: Z saved\"
 - Keep a running total of tokens saved across all plugin calls in this conversation
 $MARKER_END"
+
+# Clean up legacy markers from older versions (<!-- claude-token-saver -->)
+if [[ -f "$CLAUDE_MD" ]] && grep -q "$OLD_MARKER" "$CLAUDE_MD" 2>/dev/null; then
+    python3 -c "
+import re
+with open('$CLAUDE_MD', 'r') as f:
+    content = f.read()
+# Remove everything between paired old markers (inclusive)
+pattern = re.compile(
+    re.escape('$OLD_MARKER') + r'.*?' + re.escape('$OLD_MARKER'),
+    re.DOTALL
+)
+content = pattern.sub('', content)
+# Clean up any leftover blank lines from removal
+content = re.sub(r'\n{3,}', '\n\n', content)
+with open('$CLAUDE_MD', 'w') as f:
+    f.write(content)
+"
+    echo "[claude-token-saver] Cleaned up legacy markers from CLAUDE.md"
+fi
 
 # If markers exist, check if content needs updating
 if [[ -f "$CLAUDE_MD" ]] && grep -q "$MARKER_START" "$CLAUDE_MD" 2>/dev/null; then
