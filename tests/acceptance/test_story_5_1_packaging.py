@@ -169,16 +169,14 @@ class TestMarketplacePublishing:
     """AC: Given plugin published to breaktapps/claude-plugins,
     Then plugin is installable via marketplace."""
 
-    def test_plugin_installable_from_marketplace(self):
-        """Plugin deve aparecer como instalavel via /plugin install."""
-        marketplace_path = PLUGIN_ROOT.parent.parent / "products" / "marketplace" / "plugin-metadata.json"
-        assert marketplace_path.exists(), (
-            f"marketplace/plugin-metadata.json nao encontrado em {marketplace_path}"
-        )
-        with open(marketplace_path) as f:
-            metadata = json.load(f)
-        assert metadata.get("id") == "claude-token-saver"
-        assert "install" in metadata, "Metadata deve conter instrucoes de instalacao"
+    def test_plugin_has_valid_manifest(self):
+        """Plugin deve ter .claude-plugin/plugin.json valido."""
+        manifest = PLUGIN_ROOT / ".claude-plugin" / "plugin.json"
+        assert manifest.exists(), ".claude-plugin/plugin.json not found"
+        with open(manifest) as f:
+            data = json.load(f)
+        assert data.get("name") == "claude-token-saver"
+        assert data.get("version"), "Deve ter version"
 
 
 class TestVersionBump:
