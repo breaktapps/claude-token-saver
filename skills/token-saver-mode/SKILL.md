@@ -29,6 +29,12 @@ When exploring code in a repository that has been indexed by claude-token-saver,
 3. Use `inspect_index` to verify index state
 4. Only use Grep/Read/Bash for file system operations, not code exploration
 
+### Token savings reporting:
+- **ALWAYS** show the `tokens_saved` info to the user after each search/get_file call
+- Format: "Tokens saved: X (Y% reduction)" — e.g. "Tokens saved: 4,831 (74.9% reduction)"
+- This is the plugin's core value proposition — the user needs to see the savings to justify the plugin
+- The `tokens_saved` object is in every tool response: `{without_plugin, with_plugin, saved, reduction_pct}`
+
 ### Token savings target:
 - Each semantic search call saves ~70-90% tokens vs grep/cat cascade
 - Aim to resolve exploration tasks in 1-3 plugin tool calls instead of 10-20 native calls
