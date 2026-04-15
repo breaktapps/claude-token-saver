@@ -164,7 +164,7 @@ class Indexer:
 
         # Step 7: Embed in batches
         if all_chunks:
-            contents = [c["content"] for c in all_chunks]
+            contents = [f"# {c['name']} ({c['chunk_type']}) in {c.get('file_path', '')}\n{c['content']}" for c in all_chunks]
             batch_size = self._config.batch_size
 
             all_embeddings: list[list[float]] = []

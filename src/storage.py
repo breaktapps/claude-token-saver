@@ -122,12 +122,14 @@ class Storage:
         return self._table
 
     def _ensure_fts_index(self) -> None:
-        """Create FTS index on content field if not already created."""
+        """Create FTS index on content, name, and file_path fields."""
         if self._fts_created:
             return
         table = self._get_or_create_table()
         try:
             table.create_fts_index("content", replace=True)
+            table.create_fts_index("name", replace=True)
+            table.create_fts_index("file_path", replace=True)
             self._fts_created = True
         except Exception:
             # FTS index creation can fail on empty tables
@@ -336,6 +338,27 @@ class Storage:
                     "file_path", "chunk_type", "name", "line_start", "line_end",
                     "content", "language", "file_hash", "parent_name", "calls_json",
                 ])
+                .to_list()
+            )
+        except Exception:
+            return []
+        return results
+
+    def search_by_name(self, name: str) -> list[dict]:
+        """Look up chunks by exact name match.
+
+        Returns list of dicts with full chunk fields. Returns empty list if not found.
+        """
+        table = self._get_or_create_table()
+        try:
+            results = (
+                table.search()
+                .where(f"name = '{_escape_sql(name)}'")
+                .select([
+                    "file_path", "chunk_type", "name", "line_start", "line_end",
+                    "content", "language", "file_hash", "parent_name", "calls_json",
+                ])
+                .limit(1)
                 .to_list()
             )
         except Exception:

@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -79,7 +80,8 @@ def _init_components() -> tuple:
 
 
 def _format_search_response(results: list, tokens_saved: dict, query_time_ms: int,
-                            index_status: str, idx_info: dict) -> str:
+                            index_status: str, idx_info: dict,
+                            coverage: dict | None = None) -> str:
     """Format search results as JSON with a human-readable summary field."""
     # Build summary for the agent to show the user
     summary_lines = []
@@ -128,6 +130,9 @@ def _format_search_response(results: list, tokens_saved: dict, query_time_ms: in
         },
     }
 
+    if coverage is not None:
+        response["coverage"] = coverage
+
     return json.dumps(response, ensure_ascii=False)
 
 
@@ -151,6 +156,72 @@ async def _ensure_indexed(indexer: Indexer, storage: Storage) -> dict:
     logger.info(notice)
 
     return {"status": "first_index", "notice": notice}
+
+
+def _expand_via_calls(
+    results: list[dict],
+    raw_results: list[dict],
+    top_k: int,
+    storage: Storage,
+) -> list[dict]:
+    """Expand results by following calls_json one hop.
+
+    For each result, parses calls_json from the corresponding raw record, looks up
+    each called function by exact name, and returns expanded chunks (not already in
+    results) with score = parent_score * 0.8 and expanded=True.
+
+    Limits total expansions to int(top_k * 0.5).
+    """
+    max_expansions = int(top_k * 0.5)
+    existing_names = {r.get("name", "") for r in results}
+    expanded: list[dict] = []
+
+    for i, raw in enumerate(raw_results):
+        if len(expanded) >= max_expansions:
+            break
+
+        calls_json_str = raw.get("calls_json", "[]")
+        try:
+            called_names = json.loads(calls_json_str) if calls_json_str else []
+        except (json.JSONDecodeError, TypeError):
+            called_names = []
+
+        if not called_names:
+            continue
+
+        parent_score = results[i].get("score", 0.0) if i < len(results) else 0.0
+
+        for name in called_names:
+            if len(expanded) >= max_expansions:
+                break
+            if not name or name in existing_names:
+                continue
+
+            found = storage.search_by_name(name)
+            if not found:
+                continue
+
+            rec = found[0]
+            fp = rec.get("file_path", "")
+            file_hash = rec.get("file_hash", "")
+            stale = storage.is_stale(fp, file_hash) if fp and file_hash else False
+
+            expanded.append({
+                "file_path": fp,
+                "name": rec.get("name", ""),
+                "chunk_type": rec.get("chunk_type", ""),
+                "line_start": rec.get("line_start", 0),
+                "line_end": rec.get("line_end", 0),
+                "content": rec.get("content", ""),
+                "score": round(parent_score * 0.8, 6),
+                "language": rec.get("language", ""),
+                "stale": stale,
+                "parent_name": rec.get("parent_name", ""),
+                "expanded": True,
+            })
+            existing_names.add(name)
+
+    return expanded
 
 
 @mcp.tool(
@@ -200,6 +271,7 @@ async def search_semantic(
 
         # Build results with stale check; apply score_threshold filter
         results = []
+        accepted_raw = []
         for r in raw_results:
             score = round(1.0 - r.get("_distance", 0.0), 4)
             if score < config.score_threshold:
@@ -221,14 +293,20 @@ async def search_semantic(
                 "stale": stale,
                 "parent_name": r.get("parent_name", ""),
             })
+            accepted_raw.append(r)
+
+        # Graph expansion: follow calls_json one hop
+        expanded = _expand_via_calls(results, accepted_raw, top_k, storage)
+        results = results + expanded
 
         # Calculate token savings (persists cumulative metrics)
         tokens_saved = calculate_savings(results, repo_path, index_path=storage.index_path)
 
+        coverage = _build_coverage(results, storage, query)
         query_time_ms = int((time.perf_counter() - start) * 1000)
         logger.info("search_semantic: query=%r, results=%d, time=%dms", query, len(results), query_time_ms)
 
-        return _format_search_response(results, tokens_saved, query_time_ms, index_status, _idx)
+        return _format_search_response(results, tokens_saved, query_time_ms, index_status, _idx, coverage)
 
     except CTSError as e:
         return json.dumps({
@@ -369,10 +447,11 @@ async def search_exact(
         # Calculate token savings (persists cumulative metrics)
         tokens_saved = calculate_savings(results, repo_path, index_path=storage.index_path)
 
+        coverage = _build_coverage(results, storage, query)
         query_time_ms = int((time.perf_counter() - start) * 1000)
         logger.info("search_exact: query=%r, results=%d, time=%dms", query, len(results), query_time_ms)
 
-        return _format_search_response(results, tokens_saved, query_time_ms, index_status, _idx)
+        return _format_search_response(results, tokens_saved, query_time_ms, index_status, _idx, coverage)
 
     except CTSError as e:
         return json.dumps({
@@ -638,12 +717,124 @@ async def get_file(file_path: str) -> str:
         })
 
 
+_STOP_WORDS_PT = frozenset({
+    "o", "a", "os", "as", "um", "uma", "uns", "umas",
+    "de", "do", "da", "dos", "das", "em", "no", "na", "nos", "nas",
+    "por", "para", "com", "sem", "sob", "sobre",
+    "e", "ou", "mas", "que", "se", "como", "quando",
+    "ao", "aos", "pelo", "pela", "pelos", "pelas",
+    "este", "esta", "esse", "essa", "aquele", "aquela",
+    "isto", "isso", "aquilo",
+    "eu", "tu", "ele", "ela", "nos", "vos", "eles", "elas",
+    "meu", "minha", "seu", "sua", "nosso", "nossa",
+    "ser", "estar", "ter", "haver", "fazer", "ir",
+    "nao", "mais", "muito", "tambem", "ja", "ainda",
+})
+
+_STOP_WORDS_EN = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "can",
+    "in", "on", "at", "to", "for", "of", "with", "by", "from",
+    "and", "or", "but", "not", "no", "if", "then", "than",
+    "this", "that", "these", "those", "it", "its",
+    "i", "you", "he", "she", "we", "they",
+    "my", "your", "his", "her", "our", "their",
+    "what", "which", "who", "how", "when", "where", "why",
+})
+
+_IDENTIFIER_RE = re.compile(r'[a-z][a-zA-Z0-9]*[A-Z]|[a-zA-Z_]\w*_\w+|[A-Z][a-z]+[A-Z]')
+
+_STOP_WORDS = _STOP_WORDS_PT | _STOP_WORDS_EN
+
+
+def _filter_stop_words(query: str) -> str:
+    if not query:
+        return query
+    tokens = query.split()
+    if len(tokens) <= 5:
+        return query
+    filtered = []
+    for token in tokens:
+        if _IDENTIFIER_RE.search(token):
+            filtered.append(token)
+        elif token.lower() not in _STOP_WORDS:
+            filtered.append(token)
+    if not filtered:
+        return query
+    return " ".join(filtered)
+
+
+_RRF_K = 60
+
+
+def _dedup_key(r: dict) -> tuple:
+    return (r.get("file_path", ""), r.get("name", ""), r.get("line_start", 0))
+
+
+def _rrf_merge(
+    vector_raw: list[dict],
+    fts_raw: list[dict],
+    fetch_k: int,
+    top_k: int,
+    storage: Storage,
+) -> list[dict]:
+    absent_rank = fetch_k + 1
+
+    vec_rank: dict[tuple, tuple[int, dict]] = {}
+    for rank, r in enumerate(vector_raw):
+        key = _dedup_key(r)
+        if key not in vec_rank:
+            vec_rank[key] = (rank, r)
+
+    fts_rank: dict[tuple, tuple[int, dict]] = {}
+    for rank, r in enumerate(fts_raw):
+        key = _dedup_key(r)
+        if key not in fts_rank:
+            fts_rank[key] = (rank, r)
+
+    all_keys = set(vec_rank) | set(fts_rank)
+    scored: list[tuple[float, dict]] = []
+
+    for key in all_keys:
+        v_rank = vec_rank[key][0] if key in vec_rank else absent_rank
+        f_rank = fts_rank[key][0] if key in fts_rank else absent_rank
+        rrf_score = 1.0 / (_RRF_K + v_rank) + 1.0 / (_RRF_K + f_rank)
+
+        if key in vec_rank:
+            rec = vec_rank[key][1]
+        else:
+            rec = fts_rank[key][1]
+
+        fp = rec.get("file_path", "")
+        file_hash = rec.get("file_hash", "")
+        stale = storage.is_stale(fp, file_hash) if fp and file_hash else False
+
+        scored.append((rrf_score, {
+            "file_path": fp,
+            "name": rec.get("name", ""),
+            "chunk_type": rec.get("chunk_type", ""),
+            "line_start": rec.get("line_start", 0),
+            "line_end": rec.get("line_end", 0),
+            "content": rec.get("content", ""),
+            "score": round(rrf_score, 6),
+            "language": rec.get("language", ""),
+            "stale": stale,
+            "parent_name": rec.get("parent_name", ""),
+            "calls_json": rec.get("calls_json", "[]"),
+        }))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored[:top_k]]
+
+
 @mcp.tool(
     description=(
         "Hybrid search combining semantic (vector) and exact (FTS) approaches "
-        "for maximum recall. Use when you want both conceptual matches AND exact "
-        "name/token matches in one query. Returns merged, de-duplicated results "
-        "ranked by combined relevance score. USE INSTEAD OF running search_semantic "
+        "via Reciprocal Rank Fusion (RRF) for maximum recall. "
+        "USE INSTEAD OF Grep for maximum recall — combines conceptual matches "
+        "AND exact name/token matches in one query. Returns merged, de-duplicated "
+        "results ranked by RRF score. USE INSTEAD OF running search_semantic "
         "and search_exact separately. "
         "Supports filters: filter_ext (e.g., '.py'), filter_path (e.g., 'src/'). "
         "Alias: file_filter — if starts with '.' or '*.' it maps to filter_ext, "
@@ -681,6 +872,8 @@ async def search_hybrid(
         # Run both branches in parallel; fetch top_k*2 to allow for overlap
         fetch_k = top_k * 2
 
+        fts_query = _filter_stop_words(query)
+
         def _run_vector():
             query_vector = embed_provider.embed_query(query)
             return storage.search_vector(
@@ -689,7 +882,7 @@ async def search_hybrid(
 
         def _run_fts():
             return storage.search_fts(
-                query, top_k=fetch_k, filter_ext=filter_ext, filter_path=filter_path
+                fts_query, top_k=fetch_k, filter_ext=filter_ext, filter_path=filter_path
             )
 
         loop = asyncio.get_running_loop()
@@ -698,67 +891,18 @@ async def search_hybrid(
             loop.run_in_executor(None, _run_fts),
         )
 
-        # Index vector results by dedup key → (record, vector_score)
-        def _dedup_key(r: dict) -> tuple:
-            return (r.get("file_path", ""), r.get("name", ""), r.get("line_start", 0))
+        results = _rrf_merge(vector_raw, fts_raw, fetch_k, top_k, storage)
 
-        vec_map: dict[tuple, tuple[dict, float]] = {}
-        for r in vector_raw:
-            key = _dedup_key(r)
-            score = round(1.0 - r.get("_distance", 0.0), 4)
-            vec_map[key] = (r, score)
-
-        fts_map: dict[tuple, tuple[dict, float]] = {}
-        for r in fts_raw:
-            key = _dedup_key(r)
-            score = r.get("_score", r.get("score", 0.0))
-            fts_map[key] = (r, score)
-
-        # Merge all unique keys
-        all_keys = set(vec_map) | set(fts_map)
-        merged: list[dict] = []
-        for key in all_keys:
-            in_vec = key in vec_map
-            in_fts = key in fts_map
-
-            if in_vec and in_fts:
-                rec, v_score = vec_map[key]
-                _, f_score = fts_map[key]
-                # 1.2x boost for items found by both methods; capped at 1.0
-                combined_score = round(min(max(v_score, f_score) * 1.2, 1.0), 4)
-            elif in_vec:
-                rec, v_score = vec_map[key]
-                combined_score = v_score
-            else:
-                rec, f_score = fts_map[key]
-                combined_score = f_score
-
-            fp = rec.get("file_path", "")
-            file_hash = rec.get("file_hash", "")
-            stale = storage.is_stale(fp, file_hash) if fp and file_hash else False
-
-            merged.append({
-                "file_path": fp,
-                "name": rec.get("name", ""),
-                "chunk_type": rec.get("chunk_type", ""),
-                "line_start": rec.get("line_start", 0),
-                "line_end": rec.get("line_end", 0),
-                "content": rec.get("content", ""),
-                "score": combined_score,
-                "language": rec.get("language", ""),
-                "stale": stale,
-                "parent_name": rec.get("parent_name", ""),
-            })
-
-        # Sort by combined score descending, apply score_threshold, and limit to top_k
-        merged.sort(key=lambda x: x["score"], reverse=True)
-        results = [r for r in merged if r["score"] >= config.score_threshold][:top_k]
+        # Graph expansion: follow calls_json one hop (results include calls_json from _rrf_merge)
+        expanded = _expand_via_calls(results, results, top_k, storage)
+        results = results + expanded
 
         tokens_saved = calculate_savings(results, repo_path, index_path=storage.index_path)
+        coverage = _build_coverage(results, storage, query)
         query_time_ms = int((time.perf_counter() - start) * 1000)
         logger.info("search_hybrid: query=%r, results=%d, time=%dms", query, len(results), query_time_ms)
 
-        return _format_search_response(results, tokens_saved, query_time_ms, index_status, _idx)
+        return _format_search_response(results, tokens_saved, query_time_ms, index_status, _idx, coverage)
 
     except CTSError as e:
         return json.dumps({
@@ -887,6 +1031,53 @@ async def audit_search(query: str, top_k: int = 10) -> str:
             "error": f"Unexpected error: {str(e)}",
             "suggestion": "Please report this issue. Try running reindex.",
         })
+
+
+def _build_coverage(results: list[dict], storage: Storage, query: str) -> dict:
+    all_meta = storage.get_all_chunks_metadata()
+    languages_indexed = sorted({m["language"] for m in all_meta if m.get("language")})
+    languages_with_results = sorted({r["language"] for r in results if r.get("language")})
+
+    if not languages_indexed:
+        return {
+            "languages_indexed": [],
+            "languages_with_results": languages_with_results,
+            "confidence": "low",
+            "suggestion": "",
+        }
+
+    scores = [r.get("score", 0.0) for r in results]
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+
+    total = len(languages_indexed)
+    covered = len(languages_with_results)
+    coverage_ratio = covered / total if total > 0 else 0.0
+
+    if coverage_ratio >= 0.8 and avg_score > 0.7:
+        confidence = "high"
+    elif coverage_ratio >= 0.5 or 0.5 <= avg_score <= 0.7:
+        confidence = "partial"
+    else:
+        confidence = "low"
+
+    suggestion = ""
+    if confidence != "high" and len(query.split()) > 1:
+        missing = sorted(set(languages_indexed) - set(languages_with_results))
+        if missing:
+            covered_str = ", ".join(languages_with_results) if languages_with_results else "nenhuma linguagem"
+            suggestion = (
+                f"Resultados cobrem apenas {covered_str}. "
+                "Para cobertura cross-language, considere Explorer."
+            )
+        else:
+            suggestion = "Para cobertura completa, considere Explorer."
+
+    return {
+        "languages_indexed": languages_indexed,
+        "languages_with_results": languages_with_results,
+        "confidence": confidence,
+        "suggestion": suggestion,
+    }
 
 
 def _error_suggestion(error: CTSError) -> str:
