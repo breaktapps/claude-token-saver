@@ -245,9 +245,10 @@ async def search_semantic(
 @mcp.tool(
     description=(
         "Re-index the repository to keep search up to date. "
-        "force=false (default): incremental mode — only re-processes files whose hash changed, "
-        "adds new files, removes deleted files. Fast for day-to-day use. "
-        "force=true: drops the entire index and rebuilds from scratch. Use when the index seems corrupt. "
+        "IMPORTANT: Tell the user indexing is in progress before calling — "
+        "first-time indexing takes 30-60s, incremental takes 1-3s. "
+        "force=false (default): incremental, only changed files. "
+        "force=true: full rebuild. "
         "Returns: files_scanned, files_updated, files_deleted, files_added, chunks_created, duration_ms."
     )
 )
