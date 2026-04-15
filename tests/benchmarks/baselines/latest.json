@@ -1,0 +1,42 @@
+{
+  "meta": {
+    "version": "0.1.6",
+    "golden_set": "cts_internal",
+    "n_queries": 13,
+    "k": 10,
+    "note": "Initial baseline — populated with expected metric floors. Run runner.py to replace with real measurements.",
+    "timestamp": "2026-04-15T00:00:00+00:00"
+  },
+  "per_method": {
+    "semantic": {
+      "precision@10": 0.50,
+      "recall@10": 0.45,
+      "f1@10": 0.47,
+      "mrr": 0.55,
+      "ndcg@10": 0.50,
+      "coverage": 0.70,
+      "token_efficiency_ratio": 0.30,
+      "avg_latency_ms": 400
+    },
+    "exact": {
+      "precision@10": 0.65,
+      "recall@10": 0.55,
+      "f1@10": 0.59,
+      "mrr": 0.70,
+      "ndcg@10": 0.60,
+      "coverage": 0.75,
+      "token_efficiency_ratio": 0.35,
+      "avg_latency_ms": 150
+    },
+    "hybrid": {
+      "precision@10": 0.60,
+      "recall@10": 0.50,
+      "f1@10": 0.54,
+      "mrr": 0.65,
+      "ndcg@10": 0.55,
+      "coverage": 0.72,
+      "token_efficiency_ratio": 0.32,
+      "avg_latency_ms": 450
+    }
+  }
+}

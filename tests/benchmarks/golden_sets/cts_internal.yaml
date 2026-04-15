@@ -1,0 +1,235 @@
+# Golden test set for claude-token-saver (self-test)
+# Queries against THIS repository — always available, no external deps.
+# All function/class names are real identifiers from src/*.py.
+#
+# Relevance scale:
+#   3 = directly answers the query
+#   2 = necessary context to understand the answer
+#   1 = marginally relevant
+#   0 = irrelevant
+
+repo: "claude-token-saver"
+languages: [python]
+
+queries:
+
+  # ─── exact_name ────────────────────────────────────────────────────────────
+
+  - id: "cts-001"
+    category: "exact_name"
+    query: "EmbeddingProvider"
+    difficulty: "easy"
+    expected_results:
+      - file: "products/plugin/src/embeddings.py"
+        name: "EmbeddingProvider"
+        relevance: 3
+      - file: "products/plugin/src/embeddings.py"
+        name: "embed_query"
+        relevance: 2
+      - file: "products/plugin/src/embeddings.py"
+        name: "embed_texts"
+        relevance: 2
+    coverage_dirs:
+      - "src/embeddings.py"
+
+  - id: "cts-002"
+    category: "exact_name"
+    query: "Storage"
+    difficulty: "easy"
+    expected_results:
+      - file: "products/plugin/src/storage.py"
+        name: "Storage"
+        relevance: 3
+      - file: "products/plugin/src/storage.py"
+        name: "upsert"
+        relevance: 2
+      - file: "products/plugin/src/storage.py"
+        name: "search_vector"
+        relevance: 2
+    coverage_dirs:
+      - "src/storage.py"
+
+  - id: "cts-003"
+    category: "exact_name"
+    query: "Indexer"
+    difficulty: "easy"
+    expected_results:
+      - file: "products/plugin/src/indexer.py"
+        name: "Indexer"
+        relevance: 3
+      - file: "products/plugin/src/indexer.py"
+        name: "reindex"
+        relevance: 2
+    coverage_dirs:
+      - "src/indexer.py"
+
+  # ─── exact_function ────────────────────────────────────────────────────────
+
+  - id: "cts-004"
+    category: "exact_function"
+    query: "detect_language"
+    difficulty: "easy"
+    expected_results:
+      - file: "products/plugin/src/chunker.py"
+        name: "detect_language"
+        relevance: 3
+    coverage_dirs:
+      - "src/chunker.py"
+
+  - id: "cts-005"
+    category: "exact_function"
+    query: "calculate_savings"
+    difficulty: "easy"
+    expected_results:
+      - file: "products/plugin/src/metrics.py"
+        name: "calculate_savings"
+        relevance: 3
+      - file: "products/plugin/src/metrics.py"
+        name: "_update_cumulative"
+        relevance: 2
+    coverage_dirs:
+      - "src/metrics.py"
+
+  - id: "cts-006"
+    category: "exact_function"
+    query: "scan_files"
+    difficulty: "easy"
+    expected_results:
+      - file: "products/plugin/src/chunker.py"
+        name: "scan_files"
+        relevance: 3
+      - file: "products/plugin/src/chunker.py"
+        name: "_should_ignore"
+        relevance: 2
+    coverage_dirs:
+      - "src/chunker.py"
+
+  # ─── concept_single_lang ───────────────────────────────────────────────────
+
+  - id: "cts-007"
+    category: "concept_single_lang"
+    query: "como o plugin faz cache de embeddings de queries"
+    difficulty: "medium"
+    expected_results:
+      - file: "products/plugin/src/embeddings.py"
+        name: "embed_query"
+        relevance: 3
+      - file: "products/plugin/src/embeddings.py"
+        name: "EmbeddingProvider"
+        relevance: 2
+      - file: "products/plugin/src/embeddings.py"
+        name: "_embed_query_uncached"
+        relevance: 2
+    coverage_dirs:
+      - "src/embeddings.py"
+
+  - id: "cts-008"
+    category: "concept_single_lang"
+    query: "como o indexer detecta arquivos que mudaram desde a última indexação"
+    difficulty: "medium"
+    expected_results:
+      - file: "products/plugin/src/storage.py"
+        name: "is_stale"
+        relevance: 3
+      - file: "products/plugin/src/storage.py"
+        name: "get_file_hashes"
+        relevance: 3
+      - file: "products/plugin/src/indexer.py"
+        name: "reindex"
+        relevance: 2
+      - file: "products/plugin/src/indexer.py"
+        name: "_compute_file_hash"
+        relevance: 2
+    coverage_dirs:
+      - "src/storage.py"
+      - "src/indexer.py"
+
+  - id: "cts-009"
+    category: "concept_single_lang"
+    query: "onde fica o controle de file lock para escrita no LanceDB"
+    difficulty: "medium"
+    expected_results:
+      - file: "products/plugin/src/storage.py"
+        name: "_acquire_lock"
+        relevance: 3
+      - file: "products/plugin/src/storage.py"
+        name: "upsert"
+        relevance: 2
+    coverage_dirs:
+      - "src/storage.py"
+
+  - id: "cts-010"
+    category: "concept_single_lang"
+    query: "como o servidor MCP inicializa os componentes de forma lazy"
+    difficulty: "medium"
+    expected_results:
+      - file: "products/plugin/src/server.py"
+        name: "_init_components"
+        relevance: 3
+      - file: "products/plugin/src/server.py"
+        name: "search_semantic"
+        relevance: 2
+      - file: "products/plugin/src/server.py"
+        name: "_ensure_indexed"
+        relevance: 2
+    coverage_dirs:
+      - "src/server.py"
+
+  # ─── concept_cross_lang ────────────────────────────────────────────────────
+  # (For a Python-only repo these queries test cross-module concept search)
+
+  - id: "cts-011"
+    category: "concept_cross_lang"
+    query: "como os resultados de busca são formatados antes de retornar ao agente"
+    difficulty: "hard"
+    expected_results:
+      - file: "products/plugin/src/server.py"
+        name: "_format_search_response"
+        relevance: 3
+      - file: "products/plugin/src/server.py"
+        name: "search_semantic"
+        relevance: 2
+      - file: "products/plugin/src/server.py"
+        name: "search_exact"
+        relevance: 2
+      - file: "products/plugin/src/server.py"
+        name: "search_hybrid"
+        relevance: 2
+    coverage_dirs:
+      - "src/server.py"
+
+  - id: "cts-012"
+    category: "concept_cross_lang"
+    query: "como funciona a mesclagem RRF no search_hybrid"
+    difficulty: "hard"
+    expected_results:
+      - file: "products/plugin/src/server.py"
+        name: "_rrf_merge"
+        relevance: 3
+      - file: "products/plugin/src/server.py"
+        name: "search_hybrid"
+        relevance: 3
+      - file: "products/plugin/src/server.py"
+        name: "_expand_via_calls"
+        relevance: 1
+    coverage_dirs:
+      - "src/server.py"
+
+  # ─── pattern_usage ─────────────────────────────────────────────────────────
+
+  - id: "cts-013"
+    category: "pattern_usage"
+    query: "onde as métricas acumuladas de tokens são persistidas em disco"
+    difficulty: "medium"
+    expected_results:
+      - file: "products/plugin/src/metrics.py"
+        name: "_save_metrics"
+        relevance: 3
+      - file: "products/plugin/src/metrics.py"
+        name: "_update_cumulative"
+        relevance: 3
+      - file: "products/plugin/src/metrics.py"
+        name: "_load_metrics"
+        relevance: 2
+    coverage_dirs:
+      - "src/metrics.py"

@@ -1,7 +1,6 @@
 """AST-based code chunking for claude-token-saver.
 
-Uses tree-sitter for Python and TypeScript/JavaScript parsing.
-Uses regex-based parsing for Dart (no pip-installable grammar).
+Uses tree-sitter for Python, TypeScript/JavaScript, and Dart parsing.
 Extracts semantic chunks with metadata: class outlines, methods, functions.
 """
 
@@ -10,7 +9,6 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any
 
@@ -141,9 +139,8 @@ def parse(
     logger.debug("Parsing %s (%s)", file_path, language)
 
     if language == "dart":
-        return _parse_dart(source, rel_path, max_chunk_lines)
-    else:
-        return _parse_tree_sitter(source, rel_path, language, max_chunk_lines)
+        return _parse_dart_tree_sitter(source, rel_path, max_chunk_lines)
+    return _parse_tree_sitter(source, rel_path, language, max_chunk_lines)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -175,6 +172,15 @@ def _get_language(language: str) -> Language:
     elif language == "javascript":
         import tree_sitter_javascript as tsj
         return Language(tsj.language())
+    elif language == "dart":
+        try:
+            import tree_sitter_dart as tsd
+        except ImportError as exc:
+            raise ImportError(
+                "tree-sitter-dart is not installed. "
+                "Build and install from: https://github.com/UserNobody14/tree-sitter-dart"
+            ) from exc
+        return Language(tsd.language())
     else:
         raise ValueError(f"No tree-sitter grammar for language: {language}")
 
@@ -609,192 +615,365 @@ def _call_name(node: Node) -> str | None:
 
 
 # ──────────────────────────────────────────────────────────────
-# Dart regex-based parsing (no pip grammar available)
+# Dart tree-sitter parsing
 # ──────────────────────────────────────────────────────────────
 
-_DART_CLASS_RE = re.compile(
-    r"^(?:abstract\s+)?class\s+(\w+)(?:\s+extends\s+\w+)?(?:\s+implements\s+[\w,\s]+)?(?:\s+with\s+[\w,\s]+)?\s*\{",
-    re.MULTILINE,
-)
+# Dart AST node types that define class-like containers
+_DART_CLASS_LIKE = {"class_definition", "mixin_declaration", "extension_declaration"}
 
-_DART_METHOD_RE = re.compile(
-    r"^\s+(?:(?:static|async|Future<\w+>|void|int|double|String|bool|dynamic|List<\w+>|Map<\w+,\s*\w+>|\w+)\s+)+(\w+)\s*\([^)]*\)\s*(?:async\s*)?\{",
-    re.MULTILINE,
-)
-
-_DART_FUNC_RE = re.compile(
-    r"^(?:(?:Future<\w+>|void|int|double|String|bool|dynamic|\w+)\s+)(\w+)\s*\([^)]*\)\s*(?:async\s*)?\{",
-    re.MULTILINE,
-)
-
-_DART_CALL_RE = re.compile(r"(\w+)\s*\(")
-
-_DART_IMPORT_RE = re.compile(r"^import\s+'([^']+)'", re.MULTILINE)
+# Maps class-like node type to its body node type
+_DART_BODY_TYPE = {
+    "class_definition": "class_body",
+    "mixin_declaration": "class_body",
+    "extension_declaration": "extension_body",
+}
 
 
-def _parse_dart(
-    source: str,
-    file_path: str,
-    max_chunk_lines: int,
-) -> list[dict]:
-    """Parse Dart source using regex-based approach."""
-    lines = source.split("\n")
-    chunks: list[dict] = []
+def _dart_node_name(node: Node) -> str:
+    """Extract name identifier from a Dart class/mixin/extension/function node."""
+    name_node = node.child_by_field_name("name")
+    if name_node:
+        return name_node.text.decode()
+    for child in node.children:
+        if child.type == "identifier":
+            return child.text.decode()
+    return "<anonymous>"
 
-    # C2: Extract imports
-    imports = [m.group(0).strip() for m in _DART_IMPORT_RE.finditer(source)]
 
-    # Build a set of line ranges covered by classes to detect top-level functions
-    class_ranges: list[tuple[int, int]] = []
+def _dart_method_name(sig_inner: Node) -> str:
+    """Extract method name from a method_signature inner node.
 
-    # Find classes
-    for match in _DART_CLASS_RE.finditer(source):
-        class_name = match.group(1)
-        class_start = source[:match.start()].count("\n")
-        # Find matching closing brace
-        class_end = _find_closing_brace(source, match.end() - 1)
-        class_end_line = source[:class_end + 1].count("\n")
-        class_ranges.append((class_start, class_end_line))
+    Handles: function_signature, getter_signature, setter_signature,
+    factory_constructor_signature, constructor_signature.
+    """
+    sig_type = sig_inner.type
 
-        class_source = "\n".join(lines[class_start: class_end_line + 1])
+    if sig_type == "getter_signature":
+        found_get = False
+        for child in sig_inner.children:
+            if child.type == "get":
+                found_get = True
+            elif found_get and child.type == "identifier":
+                return child.text.decode()
 
-        # Extract methods within class
-        method_chunks = []
-        member_sigs = []
-        for m_match in _DART_METHOD_RE.finditer(class_source):
-            method_name = m_match.group(1)
-            m_start_line = class_start + class_source[:m_match.start()].count("\n")
-            m_brace_pos = class_source.index("{", m_match.start())
-            m_end_pos = _find_closing_brace(class_source, m_brace_pos)
-            m_end_line = class_start + class_source[:m_end_pos + 1].count("\n")
+    if sig_type == "setter_signature":
+        found_set = False
+        for child in sig_inner.children:
+            if child.type == "set":
+                found_set = True
+            elif found_set and child.type == "identifier":
+                return child.text.decode()
 
-            method_text = "\n".join(lines[m_start_line: m_end_line + 1])
-            sig = lines[m_start_line].strip()
-            member_sigs.append(sig)
+    if sig_type in ("factory_constructor_signature", "constructor_signature"):
+        # Named constructor: ClassName.name() — return the second identifier
+        identifiers = [c for c in sig_inner.children if c.type == "identifier"]
+        if len(identifiers) >= 2:
+            return identifiers[1].text.decode()
+        if identifiers:
+            return identifiers[0].text.decode()
 
-            calls = _extract_dart_calls(method_text)
+    # function_signature: find the identifier (skip return type tokens)
+    for child in sig_inner.children:
+        if child.type == "identifier":
+            return child.text.decode()
 
-            method_chunks.append({
-                "file_path": file_path,
-                "chunk_type": "method",
-                "name": method_name,
-                "line_start": m_start_line + 1,
-                "line_end": m_end_line + 1,
-                "content": method_text,
-                "language": "dart",
-                "parent_name": class_name,
-                "calls_json": json.dumps(calls),
-                "outline_json": "[]",
-                "imports_json": json.dumps(imports),
-            })
+    return "<anonymous>"
 
-        # Class outline
-        outline = f"class {class_name}:\n"
-        for sig in member_sigs:
-            outline += f"  {sig}\n"
 
-        chunks.append({
-            "file_path": file_path,
-            "chunk_type": "class",
-            "name": class_name,
-            "line_start": class_start + 1,
-            "line_end": class_end_line + 1,
-            "content": outline.strip(),
-            "language": "dart",
-            "parent_name": "",
-            "calls_json": "[]",
-            "outline_json": json.dumps(member_sigs),
-            "imports_json": json.dumps(imports),
-        })
-        chunks.extend(method_chunks)
+def _dart_extract_imports(root: Node) -> list[str]:
+    """Extract import strings from a Dart program root node."""
+    imports: list[str] = []
+    for child in root.children:
+        if child.type == "import_or_export":
+            imports.append(child.text.decode().strip())
+    return imports
 
-    # C5: Extract top-level functions (not inside any class)
-    for match in _DART_FUNC_RE.finditer(source):
-        func_name = match.group(1)
-        func_start_line = source[:match.start()].count("\n")
 
-        # Skip if this match is inside a known class range
-        if any(cs <= func_start_line <= ce for cs, ce in class_ranges):
+def _dart_extract_calls(node: Node) -> list[str]:
+    """Extract function call names from a Dart AST node.
+
+    In Dart's AST, direct calls appear as: identifier + selector(argument_part).
+    We only record the direct call identifier (bare function name), not the receiver.
+    """
+    calls: set[str] = set()
+    _dart_walk_calls(node, calls)
+    return sorted(calls)
+
+
+def _dart_walk_calls(node: Node, calls: set[str]) -> None:
+    """Recursively walk a Dart AST collecting direct function call names."""
+    children = node.children
+    for i, child in enumerate(children):
+        if child.type == "selector":
+            has_arg_part = any(cc.type == "argument_part" for cc in child.children)
+            if has_arg_part and i > 0:
+                prev = children[i - 1]
+                if prev.type == "identifier":
+                    name = prev.text.decode()
+                    if name and not name[0].isupper():
+                        calls.add(name)
+                elif prev.type == "unconditional_assignable_selector":
+                    for pc in prev.children:
+                        if pc.type == "identifier":
+                            name = pc.text.decode()
+                            if name and not name[0].isupper():
+                                calls.add(name)
+        _dart_walk_calls(child, calls)
+
+
+def _dart_get_body(node: Node, node_type: str) -> Node | None:
+    """Return the body node of a class/mixin/extension node."""
+    body_type = _DART_BODY_TYPE.get(node_type, "class_body")
+    for child in node.children:
+        if child.type == body_type:
+            return child
+    return None
+
+
+def _dart_collect_members(
+    body: Node,
+) -> list[tuple[str, Node, Node, Node]]:
+    """Collect (name, chunk_start_node, sig_node, body_end_node) tuples.
+
+    chunk_start_node: annotation node if present (for chunk line_start)
+    sig_node: method_signature or declaration (for outline signature text)
+    body_end_node: function_body or declaration (for chunk line_end)
+
+    Pairs consecutive method_signature + function_body nodes.
+    Also handles declaration nodes (constructors).
+    Skips field declarations and punctuation.
+    """
+    members: list[tuple[str, Node, Node, Node]] = []
+    children = [c for c in body.children if c.type not in ("{", "}", ";")]
+    pending_annotation: Node | None = None
+
+    i = 0
+    while i < len(children):
+        node = children[i]
+
+        if node.type == "annotation":
+            pending_annotation = node
+            i += 1
             continue
 
-        brace_pos = source.index("{", match.start())
-        func_end_pos = _find_closing_brace(source, brace_pos)
-        func_end_line = source[:func_end_pos + 1].count("\n")
+        if node.type == "method_signature":
+            if i + 1 < len(children) and children[i + 1].type == "function_body":
+                sig_node = node
+                body_node = children[i + 1]
+                sig_inner = next((c for c in sig_node.children if c.is_named), sig_node)
+                name = _dart_method_name(sig_inner)
+                chunk_start = pending_annotation if pending_annotation else sig_node
+                members.append((name, chunk_start, sig_node, body_node))
+                i += 2
+                pending_annotation = None
+                continue
 
-        func_text = "\n".join(lines[func_start_line: func_end_line + 1])
-        calls = _extract_dart_calls(func_text)
+        if node.type == "declaration":
+            sig_inner = next(
+                (c for c in node.children if "constructor" in c.type),
+                None,
+            )
+            if sig_inner is not None:
+                name = _dart_method_name(sig_inner)
+                chunk_start = pending_annotation if pending_annotation else node
+                members.append((name, chunk_start, node, node))
+            pending_annotation = None
+            i += 1
+            continue
 
-        chunks.append({
+        pending_annotation = None
+        i += 1
+
+    return members
+
+
+def _dart_member_chunk(
+    name: str,
+    chunk_start_node: Node,
+    body_node: Node,
+    parent_name: str,
+    file_path: str,
+    lines: list[str],
+    imports: list[str],
+    max_chunk_lines: int,
+) -> list[dict]:
+    """Build method chunk(s) for a Dart class member."""
+    start_line = chunk_start_node.start_point[0] + 1
+    end_line = body_node.end_point[0] + 1
+    content = "\n".join(lines[start_line - 1: end_line])
+    calls = _dart_extract_calls(body_node)
+    num_lines = end_line - start_line + 1
+
+    if num_lines <= max_chunk_lines:
+        return [{
             "file_path": file_path,
-            "chunk_type": "function",
-            "name": func_name,
-            "line_start": func_start_line + 1,
-            "line_end": func_end_line + 1,
-            "content": func_text,
+            "chunk_type": "method",
+            "name": name,
+            "line_start": start_line,
+            "line_end": end_line,
+            "content": content,
             "language": "dart",
-            "parent_name": "",
+            "parent_name": parent_name,
             "calls_json": json.dumps(calls),
             "outline_json": "[]",
             "imports_json": json.dumps(imports),
-        })
+        }]
+
+    named_children = [c for c in body_node.children if c.is_named]
+    sub_chunks: list[dict] = []
+    current: list[Node] = []
+    current_lines = 0
+    part = 1
+
+    for child in named_children:
+        child_line_count = child.end_point[0] - child.start_point[0] + 1
+        if current_lines + child_line_count > max_chunk_lines and current:
+            sub_chunks.append(_make_sub_chunk(
+                current, lines, file_path, "method", name, part,
+                parent_name, "dart", calls, imports,
+            ))
+            part += 1
+            current = []
+            current_lines = 0
+        current.append(child)
+        current_lines += child_line_count
+
+    if current:
+        sub_chunks.append(_make_sub_chunk(
+            current, lines, file_path, "method", name, part,
+            parent_name, "dart", calls, imports,
+        ))
+
+    return sub_chunks
+
+
+def _dart_class_like_chunks(
+    node: Node,
+    file_path: str,
+    lines: list[str],
+    imports: list[str],
+    max_chunk_lines: int,
+) -> list[dict]:
+    """Extract class outline + member chunks from a class/mixin/extension node."""
+    chunks: list[dict] = []
+    node_type = node.type
+    class_name = _dart_node_name(node)
+
+    body = _dart_get_body(node, node_type)
+    members = _dart_collect_members(body) if body else []
+
+    member_sigs: list[str] = []
+    for _name, _chunk_start, sig_node, _body_node in members:
+        # Use sig_node (method_signature) for the outline, not the annotation
+        sig_line = lines[sig_node.start_point[0]].strip()
+        member_sigs.append(sig_line)
+
+    outline_content = f"class {class_name}:\n"
+    for sig in member_sigs:
+        outline_content += f"  {sig}\n"
+
+    chunks.append({
+        "file_path": file_path,
+        "chunk_type": "class",
+        "name": class_name,
+        "line_start": node.start_point[0] + 1,
+        "line_end": node.end_point[0] + 1,
+        "content": outline_content.strip(),
+        "language": "dart",
+        "parent_name": "",
+        "calls_json": "[]",
+        "outline_json": json.dumps(member_sigs),
+        "imports_json": json.dumps(imports),
+    })
+
+    for name, chunk_start, _sig_node, body_node in members:
+        chunks.extend(_dart_member_chunk(
+            name, chunk_start, body_node, class_name,
+            file_path, lines, imports, max_chunk_lines,
+        ))
 
     return chunks
 
 
-def _find_closing_brace(source: str, open_pos: int) -> int:
-    """Find the matching closing brace for an opening brace.
+def _parse_dart_tree_sitter(
+    source: str,
+    file_path: str,
+    max_chunk_lines: int,
+) -> list[dict]:
+    """Parse Dart source using tree-sitter-dart AST."""
+    parser = _get_parser("dart")
+    tree = parser.parse(source.encode())
+    root = tree.root_node
+    lines = source.split("\n")
 
-    Skips braces inside single-line comments (//), block comments (/* */),
-    and string literals (single and double quotes).
-    """
-    depth = 0
-    i = open_pos
-    n = len(source)
-    while i < n:
-        ch = source[i]
-        # Single-line comment: skip to end of line
-        if ch == "/" and i + 1 < n and source[i + 1] == "/":
-            i += 2
-            while i < n and source[i] != "\n":
-                i += 1
-            continue
-        # Block comment: skip to */
-        if ch == "/" and i + 1 < n and source[i + 1] == "*":
-            i += 2
-            while i < n - 1 and not (source[i] == "*" and source[i + 1] == "/"):
-                i += 1
-            i += 2  # skip */
-            continue
-        # String literal (single or double quote, non-multiline)
-        if ch in ('"', "'"):
-            quote = ch
-            i += 1
-            while i < n:
-                if source[i] == "\\":
-                    i += 2  # skip escaped char
-                    continue
-                if source[i] == quote:
-                    break
-                i += 1
+    imports = _dart_extract_imports(root)
+    chunks: list[dict] = []
+
+    top_children = root.children
+    i = 0
+    while i < len(top_children):
+        child = top_children[i]
+
+        if child.type in _DART_CLASS_LIKE:
+            chunks.extend(_dart_class_like_chunks(
+                child, file_path, lines, imports, max_chunk_lines,
+            ))
             i += 1
             continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return i
+
+        # Top-level functions: function_signature followed by function_body
+        if child.type == "function_signature":
+            func_name = _dart_node_name(child)
+            if i + 1 < len(top_children) and top_children[i + 1].type == "function_body":
+                body_node = top_children[i + 1]
+                start_line = child.start_point[0] + 1
+                end_line = body_node.end_point[0] + 1
+                content = "\n".join(lines[start_line - 1: end_line])
+                calls = _dart_extract_calls(body_node)
+                num_lines = end_line - start_line + 1
+
+                if num_lines <= max_chunk_lines:
+                    chunks.append({
+                        "file_path": file_path,
+                        "chunk_type": "function",
+                        "name": func_name,
+                        "line_start": start_line,
+                        "line_end": end_line,
+                        "content": content,
+                        "language": "dart",
+                        "parent_name": "",
+                        "calls_json": json.dumps(calls),
+                        "outline_json": "[]",
+                        "imports_json": json.dumps(imports),
+                    })
+                else:
+                    named_children = [c for c in body_node.children if c.is_named]
+                    sub_chunks: list[dict] = []
+                    current: list[Node] = []
+                    current_lines = 0
+                    part = 1
+                    for bc in named_children:
+                        bc_line_count = bc.end_point[0] - bc.start_point[0] + 1
+                        if current_lines + bc_line_count > max_chunk_lines and current:
+                            sub_chunks.append(_make_sub_chunk(
+                                current, lines, file_path, "function", func_name, part,
+                                "", "dart", calls, imports,
+                            ))
+                            part += 1
+                            current = []
+                            current_lines = 0
+                        current.append(bc)
+                        current_lines += bc_line_count
+                    if current:
+                        sub_chunks.append(_make_sub_chunk(
+                            current, lines, file_path, "function", func_name, part,
+                            "", "dart", calls, imports,
+                        ))
+                    chunks.extend(sub_chunks)
+
+                i += 2
+                continue
+
         i += 1
-    return n - 1
 
-
-def _extract_dart_calls(source: str) -> list[str]:
-    """Extract function call names from Dart source using regex."""
-    # Exclude common keywords
-    keywords = {"if", "for", "while", "switch", "catch", "return", "class", "new", "await", "assert"}
-    calls = set()
-    for match in _DART_CALL_RE.finditer(source):
-        name = match.group(1)
-        if name not in keywords and not name[0].isupper():
-            calls.add(name)
-    return sorted(calls)
+    return chunks

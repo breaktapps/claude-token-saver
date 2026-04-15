@@ -28,4 +28,5 @@ asyncio_mode = "auto"
 markers = [
     "benchmark: testes de performance (NFR). Rodar com: pytest -m benchmark",
     "slow: testes demorados (ex: NFR3 com 500 arquivos). Excluídos do CI padrão",
+    "golden: benchmark de qualidade de busca (golden test sets). Rodar com: pytest -m golden",
 ]

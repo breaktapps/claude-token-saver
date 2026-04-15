@@ -23,6 +23,7 @@ from .embeddings import create_embedding_provider
 from .errors import CTSError
 from .indexer import Indexer, _compute_file_hash, _find_repo_root
 from .metrics import _load_metrics, calculate_savings
+from .query_expansion import EXPANSION_DICT
 from .storage import Storage
 
 _INSTRUCTIONS = (
@@ -54,6 +55,10 @@ _storage: Storage | None = None
 _indexer: Indexer | None = None
 _embed_provider = None
 _repo_path: Path | None = None
+
+# Boost multipliers applied to search_semantic scores by chunk type (post-scoring, pre-sort).
+# Not applied to search_exact (user wants specific match) or search_hybrid (RRF handles ranking).
+_TYPE_BOOST: dict[str, float] = {"class": 1.15, "function": 1.00, "method": 0.95}
 
 
 def _init_components() -> tuple:
@@ -261,39 +266,62 @@ async def search_semantic(
         _idx = await _ensure_indexed(indexer, storage)
         index_status = _idx["status"]
 
-        # Embed the query
-        query_vector = embed_provider.embed_query(query)
+        # Embed the query — optionally dual-vector via technical expansion
+        technical_query = _expand_query_to_technical(query)
 
-        # Search
-        raw_results = storage.search_vector(
-            query_vector, top_k=top_k, filter_ext=filter_ext, filter_path=filter_path
-        )
+        fetch_k = top_k * 2 if technical_query else top_k
 
-        # Build results with stale check; apply score_threshold filter
-        results = []
-        accepted_raw = []
-        for r in raw_results:
-            score = round(1.0 - r.get("_distance", 0.0), 4)
-            if score < config.score_threshold:
-                continue
+        def _run_original_vector():
+            vec = embed_provider.embed_query(query)
+            return storage.search_vector(vec, top_k=fetch_k, filter_ext=filter_ext, filter_path=filter_path)
 
-            fp = r.get("file_path", "")
-            file_hash = r.get("file_hash", "")
-            stale = storage.is_stale(fp, file_hash) if fp and file_hash else False
+        if technical_query:
+            def _run_technical_vector():
+                vec = embed_provider.embed_query(technical_query)
+                return storage.search_vector(vec, top_k=fetch_k, filter_ext=filter_ext, filter_path=filter_path)
 
-            results.append({
-                "file_path": fp,
-                "name": r.get("name", ""),
-                "chunk_type": r.get("chunk_type", ""),
-                "line_start": r.get("line_start", 0),
-                "line_end": r.get("line_end", 0),
-                "content": r.get("content", ""),
-                "score": score,
-                "language": r.get("language", ""),
-                "stale": stale,
-                "parent_name": r.get("parent_name", ""),
-            })
-            accepted_raw.append(r)
+            loop = asyncio.get_running_loop()
+            original_raw, technical_raw = await asyncio.gather(
+                loop.run_in_executor(None, _run_original_vector),
+                loop.run_in_executor(None, _run_technical_vector),
+            )
+            raw_merged = _rrf_merge(original_raw, technical_raw, fetch_k, top_k, storage)
+            # _rrf_merge already builds dicts; extract accepted_raw for graph expansion
+            accepted_raw = raw_merged
+            results = raw_merged
+        else:
+            raw_results = _run_original_vector()
+
+            # Build results with stale check; apply score_threshold filter (0.35 for cross-lingual queries)
+            results = []
+            accepted_raw = []
+            for r in raw_results:
+                score = round(1.0 - r.get("_distance", 0.0), 4)
+                if score < 0.35:
+                    continue
+
+                fp = r.get("file_path", "")
+                file_hash = r.get("file_hash", "")
+                stale = storage.is_stale(fp, file_hash) if fp and file_hash else False
+
+                results.append({
+                    "file_path": fp,
+                    "name": r.get("name", ""),
+                    "chunk_type": r.get("chunk_type", ""),
+                    "line_start": r.get("line_start", 0),
+                    "line_end": r.get("line_end", 0),
+                    "content": r.get("content", ""),
+                    "score": score,
+                    "language": r.get("language", ""),
+                    "stale": stale,
+                    "parent_name": r.get("parent_name", ""),
+                })
+                accepted_raw.append(r)
+
+            # Apply chunk type boost and re-sort by boosted score
+            for res in results:
+                res["score"] = round(res["score"] * _TYPE_BOOST.get(res["chunk_type"], 1.0), 4)
+            results.sort(key=lambda x: x["score"], reverse=True)
 
         # Graph expansion: follow calls_json one hop
         expanded = _expand_via_calls(results, accepted_raw, top_k, storage)
@@ -416,12 +444,10 @@ async def search_exact(
             query, top_k=top_k, filter_ext=filter_ext, filter_path=filter_path
         )
 
-        # Build results with stale check; apply score_threshold filter
+        # Build results with stale check; no score threshold (FTS relevance is by rank)
         results = []
         for r in raw_results:
             score = r.get("_score", r.get("score", 0.0))
-            if score < config.score_threshold:
-                continue
 
             fp = r.get("file_path", "")
             file_hash = r.get("file_hash", "")
@@ -768,6 +794,34 @@ def _filter_stop_words(query: str) -> str:
 _RRF_K = 60
 
 
+def _expand_query_to_technical(query: str) -> str | None:
+    """Expand a query to an English technical reformulation using a static dictionary.
+
+    Extracts significant terms (after stop-word removal), maps each to its
+    English code equivalents, and concatenates them into a reformulation string.
+
+    Returns None if no dictionary terms matched (caller should skip dual-vector search).
+    """
+    tokens = re.sub(r"[^\w\s]", " ", query.lower()).split()
+    expanded_terms: list[str] = []
+    seen: set[str] = set()
+
+    for token in tokens:
+        if token in _STOP_WORDS:
+            continue
+        expansions = EXPANSION_DICT.get(token)
+        if expansions:
+            for term in expansions:
+                if term not in seen:
+                    seen.add(term)
+                    expanded_terms.append(term)
+
+    if not expanded_terms:
+        return None
+
+    return " ".join(expanded_terms)
+
+
 def _dedup_key(r: dict) -> tuple:
     return (r.get("file_path", ""), r.get("name", ""), r.get("line_start", 0))
 
@@ -873,12 +927,7 @@ async def search_hybrid(
         fetch_k = top_k * 2
 
         fts_query = _filter_stop_words(query)
-
-        def _run_vector():
-            query_vector = embed_provider.embed_query(query)
-            return storage.search_vector(
-                query_vector, top_k=fetch_k, filter_ext=filter_ext, filter_path=filter_path
-            )
+        technical_query = _expand_query_to_technical(query)
 
         def _run_fts():
             return storage.search_fts(
@@ -886,12 +935,34 @@ async def search_hybrid(
             )
 
         loop = asyncio.get_running_loop()
-        vector_raw, fts_raw = await asyncio.gather(
-            loop.run_in_executor(None, _run_vector),
-            loop.run_in_executor(None, _run_fts),
-        )
 
-        results = _rrf_merge(vector_raw, fts_raw, fetch_k, top_k, storage)
+        if technical_query:
+            def _run_vector_original():
+                vec = embed_provider.embed_query(query)
+                return storage.search_vector(vec, top_k=fetch_k, filter_ext=filter_ext, filter_path=filter_path)
+
+            def _run_vector_technical():
+                vec = embed_provider.embed_query(technical_query)
+                return storage.search_vector(vec, top_k=fetch_k, filter_ext=filter_ext, filter_path=filter_path)
+
+            vec_original_raw, vec_technical_raw, fts_raw = await asyncio.gather(
+                loop.run_in_executor(None, _run_vector_original),
+                loop.run_in_executor(None, _run_vector_technical),
+                loop.run_in_executor(None, _run_fts),
+            )
+            # Merge the two semantic vectors first, then merge with FTS
+            vector_raw = _rrf_merge(vec_original_raw, vec_technical_raw, fetch_k, fetch_k, storage)
+            results = _rrf_merge(vector_raw, fts_raw, fetch_k, top_k, storage)
+        else:
+            def _run_vector():
+                vec = embed_provider.embed_query(query)
+                return storage.search_vector(vec, top_k=fetch_k, filter_ext=filter_ext, filter_path=filter_path)
+
+            vector_raw, fts_raw = await asyncio.gather(
+                loop.run_in_executor(None, _run_vector),
+                loop.run_in_executor(None, _run_fts),
+            )
+            results = _rrf_merge(vector_raw, fts_raw, fetch_k, top_k, storage)
 
         # Graph expansion: follow calls_json one hop (results include calls_json from _rrf_merge)
         expanded = _expand_via_calls(results, results, top_k, storage)

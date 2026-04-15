@@ -1,0 +1,4 @@
+# Generated benchmark reports — not committed
+*.json
+*.html
+*.csv
