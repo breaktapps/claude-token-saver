@@ -186,7 +186,7 @@ class TestTokenSavingsMetrics:
             assert "query_time_ms" in response["metadata"]
             assert "index_status" in response["metadata"]
             assert isinstance(response["metadata"]["query_time_ms"], int)
-            assert response["metadata"]["index_status"] in ("ready", "just_indexed")
+            assert response["metadata"]["index_status"] in ("ready", "first_index")
         finally:
             srv._config = old_config
             srv._storage = old_storage
@@ -256,8 +256,8 @@ class TestAutoIndexation:
             srv._repo_path = old_repo
 
     @pytest.mark.asyncio
-    async def test_auto_index_response_has_just_indexed_status(self, indexed_env):
-        """Resposta deve incluir metadata.index_status: 'just_indexed'."""
+    async def test_auto_index_response_has_first_index_status(self, indexed_env):
+        """Resposta deve incluir metadata.index_status: 'first_index'."""
         config, storage, indexer, provider, repo = indexed_env
 
         import src.server as srv
@@ -277,7 +277,7 @@ class TestAutoIndexation:
             result_json = await search_semantic("load data")
             response = json.loads(result_json)
 
-            assert response["metadata"]["index_status"] == "just_indexed"
+            assert response["metadata"]["index_status"] == "first_index"
         finally:
             srv._config = old_config
             srv._storage = old_storage

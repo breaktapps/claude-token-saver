@@ -59,38 +59,55 @@ class Indexer:
     def repo_path(self) -> Path:
         return self._repo_path
 
-    async def reindex(self, *, force: bool = False) -> dict:
+    async def reindex(self, *, force: bool = False, progress_callback=None) -> dict:
         """Run the full indexation pipeline without blocking the event loop.
 
         Args:
             force: If True, delete all existing chunks and rebuild from scratch.
                    If False (default), only re-process files whose hash changed,
                    add new files, and remove deleted files (incremental mode).
+            progress_callback: Optional callable(stage, current, total, detail)
+                   for reporting progress. Called with:
+                   - ("scanning", current, total, file_path)
+                   - ("chunking", current, total, file_path)
+                   - ("embedding", current, total, batch_info)
+                   - ("storing", 0, 0, "")
+                   - ("done", 0, 0, summary)
 
         Returns:
             Stats dict with files_scanned, files_indexed, chunks_created,
             files_updated, files_deleted, files_added, duration_ms, languages.
         """
         import asyncio
+        from functools import partial
 
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._reindex_sync, force)
+        return await loop.run_in_executor(None, partial(self._reindex_sync, force, progress_callback))
 
-    def _reindex_sync(self, force: bool = False) -> dict:
+    def _reindex_sync(self, force: bool = False, progress_callback=None) -> dict:
         """Synchronous implementation of the full indexation pipeline."""
         start_time = time.monotonic()
 
+        def _progress(stage, current=0, total=0, detail=""):
+            if progress_callback:
+                try:
+                    progress_callback(stage, current, total, detail)
+                except Exception:
+                    pass  # Never let progress reporting break indexation
+
         # Step 1: Scan current files on disk
+        _progress("scanning", 0, 0, str(self._repo_path))
         files = scan_files(self._repo_path, self._config.extra_ignore)
 
         # Step 2: Compute current hashes for all discovered files
         current_hashes: dict[str, str] = {}
-        for file_path in files:
+        for i, file_path in enumerate(files):
             language = detect_language(file_path)
             if language is None:
                 continue
             rel_path = str(file_path)
             current_hashes[rel_path] = _compute_file_hash(file_path)
+            _progress("scanning", i + 1, len(files), rel_path)
 
         # Step 3: Get stored hashes from index
         if force:
@@ -113,7 +130,8 @@ class Indexer:
         all_chunks: list[dict] = []
         languages: dict[str, int] = {}
 
-        for rel_path in files_to_process:
+        total_to_process = len(files_to_process)
+        for idx, rel_path in enumerate(files_to_process):
             file_path = Path(rel_path)
             language = detect_language(file_path)
             if language is None:
@@ -121,6 +139,8 @@ class Indexer:
 
             languages[language] = languages.get(language, 0) + 1
             file_hash = current_hashes[rel_path]
+
+            _progress("chunking", idx + 1, total_to_process, rel_path)
 
             chunks = parse(
                 file_path,
@@ -148,8 +168,11 @@ class Indexer:
             batch_size = self._config.batch_size
 
             all_embeddings: list[list[float]] = []
-            for i in range(0, len(contents), batch_size):
+            total_chunks = len(contents)
+            for i in range(0, total_chunks, batch_size):
                 batch = contents[i: i + batch_size]
+                _progress("embedding", min(i + batch_size, total_chunks), total_chunks,
+                          f"batch {i // batch_size + 1}")
                 embeddings = self._embed_provider.embed_texts(batch)
                 all_embeddings.extend(embeddings)
 
@@ -157,6 +180,7 @@ class Indexer:
                 chunk["embedding"] = embedding
 
             # Step 8: Store (upsert handles delete-then-insert per file)
+            _progress("storing", 0, 0, f"{len(all_chunks)} chunks")
             self._storage.upsert(all_chunks)
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
@@ -170,6 +194,9 @@ class Indexer:
             len(all_chunks),
             duration_ms,
         )
+
+        _progress("done", 0, 0,
+                  f"{len(all_chunks)} chunks from {len(files_to_process)} files in {duration_ms}ms")
 
         return {
             "files_scanned": len(files),

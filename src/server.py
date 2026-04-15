@@ -79,14 +79,43 @@ def _init_components() -> tuple:
 
 
 async def _ensure_indexed(indexer: Indexer, storage: Storage) -> str:
-    """Ensure the repository is indexed. Returns index_status."""
+    """Ensure the repository is indexed. Returns index_status with progress info."""
     # Check if index has any data
     hashes = storage.get_file_hashes()
     if hashes:
         return "ready"
 
-    await indexer.reindex(force=False)
-    return "just_indexed"
+    # First-time indexation — log progress for visibility
+    logger.info(
+        "First-time indexation starting for %s. "
+        "This may take 30-60s for large repositories.",
+        indexer.repo_path,
+    )
+
+    progress_log = []
+
+    def _on_progress(stage, current, total, detail):
+        if stage == "scanning" and current == total and total > 0:
+            msg = f"[claude-token-saver] Scanning complete: {total} files found"
+            logger.info(msg)
+            progress_log.append(msg)
+        elif stage == "chunking" and total > 0 and (current == total or current % 50 == 0):
+            pct = int(current / total * 100)
+            msg = f"[claude-token-saver] Chunking: {current}/{total} files ({pct}%)"
+            logger.info(msg)
+            progress_log.append(msg)
+        elif stage == "embedding" and total > 0:
+            pct = int(current / total * 100)
+            msg = f"[claude-token-saver] Embedding: {current}/{total} chunks ({pct}%)"
+            logger.info(msg)
+            progress_log.append(msg)
+        elif stage == "done":
+            msg = f"[claude-token-saver] Indexation complete: {detail}"
+            logger.info(msg)
+            progress_log.append(msg)
+
+    await indexer.reindex(force=False, progress_callback=_on_progress)
+    return "first_index"
 
 
 @mcp.tool(
