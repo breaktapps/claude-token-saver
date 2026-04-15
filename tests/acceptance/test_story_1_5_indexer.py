@@ -145,16 +145,16 @@ class TestIndexationPerformance:
         pytest.skip("Performance test -- requires 500 files, run with CTS_TEST_PERF=1")
 
     @pytest.mark.asyncio
-    async def test_async_embed_batching_50_per_batch(self, repo_path, indexer_components):
-        """Embedding deve usar batching async de 50 chunks por batch."""
+    async def test_async_embed_batching_200_per_batch(self, repo_path, indexer_components):
+        """Embedding deve usar batching de 200 chunks por batch (otimizado para throughput)."""
         config, storage, provider = indexer_components
         indexer = Indexer(config, storage, provider, repo_path=repo_path)
 
         stats = await indexer.reindex()
         # Verify batching happened (chunks created > 0 means embed was called)
         assert stats["chunks_created"] > 0
-        # Batch size is 50 by default
-        assert config.batch_size == 50
+        # Batch size is 200 by default (NFR3 optimization)
+        assert config.batch_size == 200
 
 
 class TestForceReindex:

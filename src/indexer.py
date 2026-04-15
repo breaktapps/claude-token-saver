@@ -7,6 +7,7 @@ The Indexer is a facade that coordinates chunker, embeddings, and storage.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from pathlib import Path
@@ -97,6 +98,7 @@ class Indexer:
 
         # Step 1: Scan current files on disk
         _progress("scanning", 0, 0, str(self._repo_path))
+        t_scan = time.monotonic()
         files = scan_files(self._repo_path, self._config.extra_ignore)
 
         # Step 2: Compute current hashes for all discovered files
@@ -108,6 +110,7 @@ class Indexer:
             rel_path = str(file_path)
             current_hashes[rel_path] = _compute_file_hash(file_path)
             _progress("scanning", i + 1, len(files), rel_path)
+        logger.debug("Scan+hash: %.2fs (%d files)", time.monotonic() - t_scan, len(current_hashes))
 
         # Step 3: Get stored hashes from index
         if force:
@@ -130,6 +133,7 @@ class Indexer:
         all_chunks: list[dict] = []
         languages: dict[str, int] = {}
 
+        t_chunk = time.monotonic()
         total_to_process = len(files_to_process)
         for idx, rel_path in enumerate(files_to_process):
             file_path = Path(rel_path)
@@ -153,6 +157,7 @@ class Indexer:
                 chunk["file_path"] = rel_path
 
             all_chunks.extend(chunks)
+        logger.debug("Chunking: %.2fs (%d chunks from %d files)", time.monotonic() - t_chunk, len(all_chunks), total_to_process)
 
         # Also count unchanged files' languages for stats
         unchanged = [p for p in current_hashes if p not in modified and p not in new_files]
@@ -162,26 +167,29 @@ class Indexer:
             if language is not None:
                 languages[language] = languages.get(language, 0) + 1
 
-        # Step 7: Embed in batches
+        # Step 7: Embed all chunks — provider manages internal batching via config.batch_size
         if all_chunks:
-            contents = [f"# {c['name']} ({c['chunk_type']}) in {c.get('file_path', '')}\n{c['content']}" for c in all_chunks]
-            batch_size = self._config.batch_size
-
-            all_embeddings: list[list[float]] = []
+            contents = [c["content"] for c in all_chunks]
             total_chunks = len(contents)
-            for i in range(0, total_chunks, batch_size):
-                batch = contents[i: i + batch_size]
-                _progress("embedding", min(i + batch_size, total_chunks), total_chunks,
-                          f"batch {i // batch_size + 1}")
-                embeddings = self._embed_provider.embed_texts(batch)
-                all_embeddings.extend(embeddings)
+            _progress("embedding", 0, total_chunks, f"0/{total_chunks} chunks")
+            t_embed = time.monotonic()
+            all_embeddings = self._embed_provider.embed_texts(contents)
+            logger.debug("Embedding: %.2fs (%d chunks, batch_size=%d)", time.monotonic() - t_embed, total_chunks, self._config.batch_size)
+            _progress("embedding", total_chunks, total_chunks, f"{total_chunks}/{total_chunks} chunks")
 
             for chunk, embedding in zip(all_chunks, all_embeddings):
                 chunk["embedding"] = embedding
 
             # Step 8: Store (upsert handles delete-then-insert per file)
             _progress("storing", 0, 0, f"{len(all_chunks)} chunks")
+            t_store = time.monotonic()
             self._storage.upsert(all_chunks)
+            logger.debug("Storage upsert: %.2fs", time.monotonic() - t_store)
+
+        # Step 9: Build reverse caller index (callers.json) over all indexed chunks
+        t_callers = time.monotonic()
+        self._build_callers_index()
+        logger.debug("Callers index: %.2fs", time.monotonic() - t_callers)
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -208,3 +216,38 @@ class Indexer:
             "duration_ms": duration_ms,
             "languages": languages,
         }
+
+    def _build_callers_index(self) -> None:
+        """Build inverted caller index from all indexed chunks and save as callers.json.
+
+        Iterates all chunks, parses calls_json for each, and builds a dict:
+            {called_name: [caller_chunk_name, ...]}
+
+        The result is saved as callers.json next to the LanceDB index files.
+        Also invalidates the in-memory cache on the storage instance.
+        """
+        all_chunks = self._storage.get_all_chunks_with_calls()
+
+        callers: dict[str, list[str]] = {}
+        for chunk in all_chunks:
+            caller_name = chunk.get("name", "")
+            if not caller_name:
+                continue
+            calls_json_str = chunk.get("calls_json", "[]") or "[]"
+            try:
+                called_names = json.loads(calls_json_str)
+            except (json.JSONDecodeError, TypeError):
+                called_names = []
+            for called in called_names:
+                if called:
+                    callers.setdefault(called, []).append(caller_name)
+
+        callers_path = self._storage.index_path / "callers.json"
+        try:
+            callers_path.write_text(json.dumps(callers, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not write callers.json: %s", exc)
+
+        # Invalidate the in-memory cache so the next get_callers() reloads the file
+        self._storage.invalidate_callers_cache()
+        logger.info("Built callers index: %d entries", len(callers))

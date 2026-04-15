@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import logging
 import os
 import time
@@ -98,6 +99,7 @@ class Storage:
         self._db = lancedb.connect(str(self._index_path / "index.lance"))
         self._table = None
         self._fts_created = False
+        self._callers_cache: dict[str, list[str]] | None = None
 
     @property
     def index_path(self) -> Path:
@@ -365,6 +367,30 @@ class Storage:
             return []
         return results
 
+    def get_chunks_by_directory(self, directory: str, limit: int = 50) -> list[dict]:
+        """Return chunks for all files under a directory prefix.
+
+        Uses a LIKE filter on file_path to match all files whose path starts
+        with the given directory string (e.g., 'src/models').
+        """
+        table = self._get_or_create_table()
+        dir_prefix = directory.rstrip("/") + "/"
+        where = f"file_path LIKE '{_escape_sql(dir_prefix)}%'"
+        try:
+            results = (
+                table.search()
+                .where(where)
+                .select([
+                    "file_path", "chunk_type", "name", "line_start", "line_end",
+                    "content", "language", "file_hash", "parent_name", "calls_json",
+                ])
+                .limit(limit)
+                .to_list()
+            )
+        except Exception:
+            return []
+        return results
+
     def delete_file(self, file_path: str) -> None:
         """Delete all chunks for a given file."""
         with self._acquire_lock():
@@ -373,6 +399,38 @@ class Storage:
                 table.delete(f"file_path = '{_escape_sql(file_path)}'")
             except Exception:
                 pass
+
+    def get_all_chunks_with_calls(self) -> list[dict]:
+        """Return name and calls_json for all indexed chunks (used to build callers index)."""
+        table = self._get_or_create_table()
+        try:
+            results = table.search().select(["name", "calls_json"]).to_list()
+        except Exception:
+            return []
+        return results
+
+    def get_callers(self, name: str) -> list[str]:
+        """Return list of chunk names that call the given function name.
+
+        Loads callers.json on first call and caches in memory.
+        Returns empty list if name not found or index not built yet.
+        """
+        if self._callers_cache is None:
+            callers_path = self._index_path / "callers.json"
+            if callers_path.exists():
+                try:
+                    self._callers_cache = json.loads(
+                        callers_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    self._callers_cache = {}
+            else:
+                self._callers_cache = {}
+        return list(self._callers_cache.get(name, []))
+
+    def invalidate_callers_cache(self) -> None:
+        """Clear the in-memory callers cache so the next get_callers() reloads from disk."""
+        self._callers_cache = None
 
     @staticmethod
     def _build_where(filter_ext: str | None, filter_path: str | None) -> str | None:

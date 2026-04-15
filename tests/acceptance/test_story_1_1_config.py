@@ -42,10 +42,10 @@ class TestConfigDefaults:
         config = Config.load(config_path=tmp_path / "nonexistent.yaml")
         assert config.score_threshold == 0.5
 
-    def test_default_batch_size_is_50(self, tmp_path):
-        """Config sem YAML deve usar batch_size=50."""
+    def test_default_batch_size_is_200(self, tmp_path):
+        """Config sem YAML deve usar batch_size=200 (otimizado para throughput)."""
         config = Config.load(config_path=tmp_path / "nonexistent.yaml")
-        assert config.batch_size == 50
+        assert config.batch_size == 200
 
     def test_default_max_chunk_lines_is_150(self, tmp_path):
         """Config sem YAML deve usar max_chunk_lines=150."""
@@ -71,7 +71,7 @@ class TestConfigYamlOverride:
         config = Config.load(config_path=config_file)
         assert config.top_k == 5
         assert config.score_threshold == 0.5
-        assert config.batch_size == 50
+        assert config.batch_size == 200
         assert config.max_chunk_lines == 150
 
 

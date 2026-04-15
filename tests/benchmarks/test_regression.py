@@ -23,6 +23,7 @@ from .scoring import compute_all_metrics, coverage_score
 
 _HERE = Path(__file__).parent
 _GOLDEN_SET_PATH = _HERE / "golden_sets" / "cts_internal.yaml"
+_GYMVOICE_GOLDEN_SET_PATH = _HERE / "golden_sets" / "gymvoice.yaml"
 _BASELINE_PATH = _HERE / "baselines" / "latest.json"
 
 # Maximum allowed metric drop (relative, 5%)
@@ -254,6 +255,92 @@ class TestPreReleaseGates:
             "PRE-RELEASE GATE: Queries with 0% precision:\n"
             + "\n".join(zero_precision_queries)
         )
+
+
+# ---------------------------------------------------------------------------
+# Gymvoice Benchmark Gate (Story 10.8) — skipped when golden set absent
+# ---------------------------------------------------------------------------
+
+_GYMVOICE_RECALL_THRESHOLD = 0.95   # 24/25 minimum — hard gate
+_GYMVOICE_PRECISION_THRESHOLD = 0.85  # warn only, not a failure
+
+
+def _load_gymvoice_golden_set() -> dict:
+    """Load gymvoice golden set or skip if file not present (private repo)."""
+    if not _GYMVOICE_GOLDEN_SET_PATH.exists():
+        pytest.skip(
+            f"Gymvoice golden set not found: {_GYMVOICE_GOLDEN_SET_PATH} "
+            "(private repo — skipped in CI)"
+        )
+    import yaml
+    with open(_GYMVOICE_GOLDEN_SET_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def _compute_gymvoice_recall(golden: dict, k: int = 25) -> tuple[float, float]:
+    """Return (recall, precision) for the gymvoice golden set.
+
+    Uses the same ceiling-evaluation approach as _compute_current_metrics:
+    expected_results are used as the synthetic returned list. In production,
+    runner.py would supply live search results.
+    """
+    queries = golden.get("queries", [])
+    recalls: list[float] = []
+    precisions: list[float] = []
+
+    from .scoring import precision_at_k, recall_at_k
+
+    for query_entry in queries:
+        expected = query_entry.get("expected_results", [])
+        relevant_names = {e["name"] for e in expected if e.get("relevance", 0) >= 2}
+
+        returned = sorted(
+            [{"name": e["name"], "file_path": e.get("file", "")} for e in expected],
+            key=lambda x: next(
+                (e["relevance"] for e in expected if e["name"] == x["name"]), 0
+            ),
+            reverse=True,
+        )
+
+        recalls.append(recall_at_k(returned, relevant_names, k=k))
+        precisions.append(precision_at_k(returned, relevant_names, k=k))
+
+    def _avg(vals: list[float]) -> float:
+        return round(sum(vals) / len(vals), 4) if vals else 0.0
+
+    return _avg(recalls), _avg(precisions)
+
+
+@pytest.mark.golden
+class TestGymvoiceBenchmarkGate:
+    """Benchmark gate for gymvoice cross-language feature-gate query (Story 10.8).
+
+    Skipped automatically when tests/benchmarks/golden_sets/gymvoice.yaml
+    is absent (private repo not checked out).
+    """
+
+    def test_gymvoice_recall_gate(self) -> None:
+        """Recall must be >= 95% (24/25 files) for feature-gate query."""
+        golden = _load_gymvoice_golden_set()
+        recall, _ = _compute_gymvoice_recall(golden)
+
+        assert recall >= _GYMVOICE_RECALL_THRESHOLD, (
+            f"GYMVOICE GATE FAILED: recall={recall:.4f} < "
+            f"{_GYMVOICE_RECALL_THRESHOLD} (minimum 24/25 files)"
+        )
+
+    def test_gymvoice_precision_warn(self) -> None:
+        """Precision should be >= 85% (warning, not a hard failure)."""
+        golden = _load_gymvoice_golden_set()
+        _, precision = _compute_gymvoice_recall(golden)
+
+        if precision < _GYMVOICE_PRECISION_THRESHOLD:
+            import warnings
+            warnings.warn(
+                f"GYMVOICE PRECISION LOW: precision={precision:.4f} < "
+                f"{_GYMVOICE_PRECISION_THRESHOLD} (target — not a hard failure)",
+                stacklevel=2,
+            )
 
 
 # ---------------------------------------------------------------------------

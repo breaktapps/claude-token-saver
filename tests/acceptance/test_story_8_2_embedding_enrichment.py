@@ -1,8 +1,9 @@
 """
-Acceptance tests for Story 8.2: Enriquecimento de Embedding com Metadados.
+Acceptance tests for Story 10.1: Revert Embedding Enrichment.
 
-Valida que o indexer prepara o texto de embedding com prefixo de metadados
-(nome, tipo e caminho do arquivo) antes de chamar o provider de embeddings.
+Valida que o indexer envia o conteudo puro (sem prefixo de metadados)
+ao provider de embeddings. O enriquecimento foi revertido porque dilui
+os embeddings bge-small (384-dim), causando queda de precisao de 80% para 53%.
 
 SQ: SQ3 (search-quality-spec.md secao 4.3)
 """
@@ -23,11 +24,11 @@ def _make_config(**overrides) -> Config:
     return Config(**fields)
 
 
-class TestEmbeddingEnrichmentFormat:
-    """AC1: O texto enviado ao provider deve conter o prefixo de metadados."""
+class TestEmbeddingNotEnriched:
+    """AC1: O texto enviado ao provider deve ser o conteudo puro, sem prefixo de metadados."""
 
-    def test_enriched_format_prepended_to_content(self, tmp_path):
-        """Texto para embed deve ser '# name (chunk_type) in file_path\\ncontent'."""
+    def test_content_sent_without_metadata_prefix(self, tmp_path):
+        """Texto para embed deve ser o conteudo bruto, sem '# name (chunk_type) in file_path'."""
         repo = tmp_path / "test-repo"
         repo.mkdir()
         (repo / ".git").mkdir()
@@ -53,20 +54,13 @@ class TestEmbeddingEnrichmentFormat:
 
         assert len(captured_texts) > 0, "Nenhum texto foi enviado ao provider"
         for text in captured_texts:
-            lines = text.split("\n")
-            assert lines[0].startswith("#"), (
-                f"Texto nao comeca com prefixo enriquecido: {text[:80]!r}"
-            )
-            # formato: # name (chunk_type) in file_path
-            assert "(" in lines[0] and ")" in lines[0], (
-                f"Prefixo nao contem chunk_type entre parenteses: {lines[0]!r}"
-            )
-            assert " in " in lines[0], (
-                f"Prefixo nao contem ' in file_path': {lines[0]!r}"
+            first_line = text.split("\n")[0]
+            assert not (first_line.startswith("#") and "(" in first_line and " in " in first_line), (
+                f"Texto nao deve ter prefixo de metadados enriquecido: {text[:80]!r}"
             )
 
-    def test_enriched_text_contains_name_and_type(self, tmp_path):
-        """O prefixo deve conter o nome do chunk e o chunk_type."""
+    def test_content_sent_without_name_type_prefix(self, tmp_path):
+        """O texto enviado nao deve conter o nome do chunk como prefixo na primeira linha."""
         repo = tmp_path / "test-repo"
         repo.mkdir()
         (repo / ".git").mkdir()
@@ -89,16 +83,15 @@ class TestEmbeddingEnrichmentFormat:
         indexer = Indexer(config, storage, CapturingProvider(), repo_path=repo)
         asyncio.run(indexer.reindex())
 
-        first_lines = [t.split("\n")[0] for t in captured_texts]
-        assert any("authenticate" in line for line in first_lines), (
-            f"Nome 'authenticate' nao encontrado nos prefixos: {first_lines}"
-        )
-        assert any("function" in line or "method" in line for line in first_lines), (
-            f"chunk_type nao encontrado nos prefixos: {first_lines}"
-        )
+        for text in captured_texts:
+            first_line = text.split("\n")[0]
+            # A primeira linha nao deve ser um comentario de metadados do formato enriquecido
+            assert not (first_line.startswith("# authenticate") and " in " in first_line), (
+                f"Prefixo de metadados nao deve estar presente: {first_line!r}"
+            )
 
-    def test_enriched_text_contains_file_path(self, tmp_path):
-        """O prefixo deve conter o file_path do chunk."""
+    def test_content_sent_without_file_path_prefix(self, tmp_path):
+        """O texto enviado nao deve conter o file_path como prefixo."""
         repo = tmp_path / "test-repo"
         repo.mkdir()
         (repo / ".git").mkdir()
@@ -122,17 +115,19 @@ class TestEmbeddingEnrichmentFormat:
         asyncio.run(indexer.reindex())
 
         first_lines = [t.split("\n")[0] for t in captured_texts]
-        assert any("gate.py" in line for line in first_lines), (
-            f"file_path 'gate.py' nao encontrado nos prefixos: {first_lines}"
-        )
+        # Nenhuma primeira linha deve ser um prefixo de metadados com gate.py
+        for line in first_lines:
+            assert not (line.startswith("#") and "gate.py" in line and " in " in line), (
+                f"file_path nao deve aparecer como prefixo de metadados: {line!r}"
+            )
 
 
 class TestEmbeddingDimensionUnchanged:
-    """AC4: A dimensao do vetor nao deve mudar com o enriquecimento."""
+    """AC4: A dimensao do vetor nao deve mudar apos o revert."""
 
     @pytest.mark.asyncio
-    async def test_embedding_dimension_unchanged_with_enrichment(self, tmp_path):
-        """Enriquecimento nao deve alterar a dimensao do embedding (384 para lite)."""
+    async def test_embedding_dimension_unchanged(self, tmp_path):
+        """Revert nao deve alterar a dimensao do embedding (384 para lite)."""
         repo = tmp_path / "test-repo"
         repo.mkdir()
         (repo / ".git").mkdir()
@@ -154,11 +149,11 @@ class TestEmbeddingDimensionUnchanged:
             assert "embedding" not in r or True  # embedding nao e retornado na busca
 
 
-class TestIncrementalReindexUsesEnrichedFormat:
-    """AC3: Reindex incremental tambem usa o formato enriquecido."""
+class TestIncrementalReindexNoPrefixFormat:
+    """AC3: Reindex incremental tambem usa conteudo puro (sem prefixo)."""
 
-    def test_incremental_reindex_enriches_updated_chunks(self, tmp_path):
-        """Arquivo modificado deve gerar embeddings com formato enriquecido."""
+    def test_incremental_reindex_sends_raw_content(self, tmp_path):
+        """Arquivo modificado deve gerar embeddings sem formato enriquecido."""
         repo = tmp_path / "test-repo"
         repo.mkdir()
         (repo / ".git").mkdir()
@@ -190,13 +185,13 @@ class TestIncrementalReindexUsesEnrichedFormat:
         src_file.write_text("def helper(): return 42\ndef new_func(): pass\n")
         asyncio.run(indexer.reindex())
 
-        # Ambas as execucoes devem ter enviado textos enriquecidos
+        # Nenhuma execucao deve ter enviado textos com prefixo de metadados
         for texts in [captured_texts_run1, captured_texts_run2]:
-            if texts:
-                for text in texts:
-                    assert text.split("\n")[0].startswith("#"), (
-                        f"Texto no reindex incremental nao tem prefixo enriquecido: {text[:80]!r}"
-                    )
+            for text in texts:
+                first_line = text.split("\n")[0]
+                assert not (first_line.startswith("#") and " in " in first_line), (
+                    f"Texto no reindex nao deve ter prefixo enriquecido: {text[:80]!r}"
+                )
 
 
 class TestContentFieldPreservedInStorage:

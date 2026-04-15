@@ -1,0 +1,2 @@
+# Private/external golden sets — do not commit
+tests/benchmarks/golden_sets/gymvoice.yaml

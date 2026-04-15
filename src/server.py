@@ -229,6 +229,406 @@ def _expand_via_calls(
     return expanded
 
 
+def _expand_via_callers(
+    results: list[dict],
+    top_k: int,
+    storage: Storage,
+) -> list[dict]:
+    """Expand results with reverse-index: find who calls each result.
+
+    For each result, looks up callers via the pre-built callers.json index.
+    Returns new chunks (not already in results) with score = parent_score * 0.75
+    and caller_of=<name>.
+
+    Limits:
+    - Total caller expansions: 10
+    - Skips names that have 50+ callers (too generic, e.g. 'init', 'build')
+    """
+    max_callers = 10
+    existing_names = {r.get("name", "") for r in results}
+    expanded: list[dict] = []
+
+    generic_cache: dict[str, bool] = {}
+
+    def _is_generic(name: str) -> bool:
+        if name in generic_cache:
+            return generic_cache[name]
+        caller_list = storage.get_callers(name)
+        result = len(caller_list) >= 50
+        generic_cache[name] = result
+        return result
+
+    for res in results:
+        if len(expanded) >= max_callers:
+            break
+
+        res_name = res.get("name", "")
+        if not res_name:
+            continue
+
+        if _is_generic(res_name):
+            continue
+
+        parent_score = res.get("score", 0.0)
+        caller_names = storage.get_callers(res_name)
+
+        for caller_name in caller_names:
+            if len(expanded) >= max_callers:
+                break
+            if not caller_name or caller_name in existing_names:
+                continue
+
+            found = storage.search_by_name(caller_name)
+            if not found:
+                continue
+
+            rec = found[0]
+            fp = rec.get("file_path", "")
+            file_hash = rec.get("file_hash", "")
+            stale = storage.is_stale(fp, file_hash) if fp and file_hash else False
+
+            expanded.append({
+                "file_path": fp,
+                "name": rec.get("name", ""),
+                "chunk_type": rec.get("chunk_type", ""),
+                "line_start": rec.get("line_start", 0),
+                "line_end": rec.get("line_end", 0),
+                "content": rec.get("content", ""),
+                "score": round(parent_score * 0.75, 6),
+                "language": rec.get("language", ""),
+                "stale": stale,
+                "parent_name": rec.get("parent_name", ""),
+                "expanded": True,
+                "caller_of": res_name,
+            })
+            existing_names.add(caller_name)
+
+    return expanded
+
+
+def _expand_module_siblings(
+    results: list[dict],
+    top_k: int,
+    storage: Storage,
+    filter_ext: str | None = None,
+) -> list[dict]:
+    """Add co-located chunks from directories that have 2+ results (strong signal).
+
+    For each directory with 2+ results, queries the index for OTHER chunks in
+    that same directory not already in results. Adds them with module_match=True
+    and score = max_result_score * 0.7.
+
+    Limits: max 5 co-located files added total; prefers class chunks over others.
+    filter_ext: if provided, only siblings matching that extension are added.
+    """
+    # Count results per directory
+    dir_counts: dict[str, int] = {}
+    for r in results:
+        fp = r.get("file_path", "")
+        parent = str(Path(fp).parent) if fp else ""
+        dir_counts[parent] = dir_counts.get(parent, 0) + 1
+
+    # Directories with strong signal (2+ results)
+    strong_dirs = {d for d, cnt in dir_counts.items() if cnt >= 2}
+    if not strong_dirs:
+        return []
+
+    existing_files = {r.get("file_path", "") for r in results}
+
+    max_result_score = max((r.get("score", 0.0) for r in results), default=0.0)
+    sibling_score = round(max_result_score * 0.7, 6)
+
+    # Normalize extension for filtering (ensure it starts with '.')
+    ext_filter = None
+    if filter_ext:
+        ext_filter = filter_ext if filter_ext.startswith(".") else f".{filter_ext}"
+
+    added_files: set[str] = set()
+    siblings: list[dict] = []
+
+    for directory in strong_dirs:
+        if len(added_files) >= 5:
+            break
+
+        candidates = storage.get_chunks_by_directory(directory)
+        # Filter out already-present files; keep one chunk per file
+        new_by_file: dict[str, dict] = {}
+        for c in candidates:
+            fp = c.get("file_path", "")
+            if fp in existing_files or fp in added_files:
+                continue
+            # Respect filter_ext if provided
+            if ext_filter and not fp.endswith(ext_filter):
+                continue
+            # Prefer class chunks; only store one representative chunk per file
+            existing = new_by_file.get(fp)
+            if existing is None:
+                new_by_file[fp] = c
+            elif c.get("chunk_type") == "class" and existing.get("chunk_type") != "class":
+                new_by_file[fp] = c
+
+        # Sort: class first, then others
+        candidates_sorted = sorted(
+            new_by_file.values(),
+            key=lambda c: (0 if c.get("chunk_type") == "class" else 1),
+        )
+
+        for c in candidates_sorted:
+            if len(added_files) >= 5:
+                break
+            fp = c.get("file_path", "")
+            file_hash = c.get("file_hash", "")
+            stale = storage.is_stale(fp, file_hash) if fp and file_hash else False
+            siblings.append({
+                "file_path": fp,
+                "name": c.get("name", ""),
+                "chunk_type": c.get("chunk_type", ""),
+                "line_start": c.get("line_start", 0),
+                "line_end": c.get("line_end", 0),
+                "content": c.get("content", ""),
+                "score": sibling_score,
+                "language": c.get("language", ""),
+                "stale": stale,
+                "parent_name": c.get("parent_name", ""),
+                "module_match": True,
+            })
+            added_files.add(fp)
+
+    return siblings
+
+
+_CROSS_LAYER_SUFFIXES = re.compile(
+    r'(Service|Controller|Provider|Widget|State|Screen|Handler|Guard)$',
+    re.IGNORECASE,
+)
+
+_CAMEL_TO_SNAKE_RE = re.compile(r'(?<=[a-z0-9])([A-Z])|(?<=[A-Z])([A-Z][a-z])')
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize a symbol name for cross-layer matching.
+
+    1. Convert CamelCase to snake_case.
+    2. Strip one common architectural suffix from the end (single pass).
+    3. Return lowercase with underscores.
+    """
+    s = _CAMEL_TO_SNAKE_RE.sub(lambda m: '_' + (m.group(1) or m.group(2)), name)
+    s = s.lower().replace('-', '_')
+    # Strip suffix exactly once â only the outermost suffix is architectural
+    stripped = _CROSS_LAYER_SUFFIXES.sub('', s, count=1).rstrip('_')
+    if stripped:
+        s = stripped
+    return s
+
+
+def _expand_cross_layer(results: list[dict], storage: Storage) -> list[dict]:
+    """Expand results with matching symbols from other languages (cross-layer).
+
+    For each result, normalizes the name and searches for chunks with the same
+    normalized name in OTHER languages. Found matches are added with
+    cross_layer=True and score = original_score * 0.7.
+
+    Deduplicates: skips if already present in results.
+    """
+    existing_keys: set[tuple] = {
+        (r.get("file_path", ""), r.get("name", "")) for r in results
+    }
+
+    cross_layer: list[dict] = []
+
+    for result in results:
+        source_lang = result.get("language", "")
+        source_name = result.get("name", "")
+        source_score = result.get("score", 0.0)
+
+        if not source_name:
+            continue
+
+        normalized = _normalize_name(source_name)
+        if not normalized:
+            continue
+
+        # Search by exact source name, normalized name, PascalCase, and FTS on normalized term
+        # FTS on the normalized term finds variants like SubscriptionService when searching "subscription"
+        candidates_to_try: list[str] = [source_name]
+        if normalized != source_name.lower():
+            candidates_to_try.append(normalized)
+        pascal = ''.join(w.capitalize() for w in normalized.split('_') if w)
+        if pascal and pascal != source_name:
+            candidates_to_try.append(pascal)
+
+        found_chunks: list[dict] = []
+        seen_candidate: set[str] = set()
+        for candidate in candidates_to_try:
+            if candidate in seen_candidate:
+                continue
+            seen_candidate.add(candidate)
+            found_chunks.extend(storage.search_by_name(candidate))
+        # Also search FTS with normalized base term to catch suffix variants
+        fts_hits = storage.search_fts(normalized, top_k=10)
+        found_chunks.extend(fts_hits)
+
+        for rec in found_chunks:
+            rec_lang = rec.get("language", "")
+            rec_name = rec.get("name", "")
+            rec_fp = rec.get("file_path", "")
+
+            # Only cross-layer: skip same language
+            if rec_lang == source_lang:
+                continue
+
+            key = (rec_fp, rec_name)
+            if key in existing_keys:
+                continue
+
+
+            # Verify normalized names match (exact or prefix relationship)
+            rec_normalized = _normalize_name(rec_name)
+            # Allow match if one normalized form is a prefix of the other (min 5 chars)
+            n1, n2 = normalized, rec_normalized
+            n_match = (
+                n1 == n2
+                or (len(n1) >= 5 and n2.startswith(n1))
+                or (len(n2) >= 5 and n1.startswith(n2))
+            )
+            if not n_match:
+                continue
+
+            existing_keys.add(key)
+            cross_layer.append({
+                "file_path": rec_fp,
+                "name": rec_name,
+                "chunk_type": rec.get("chunk_type", ""),
+                "line_start": rec.get("line_start", 0),
+                "line_end": rec.get("line_end", 0),
+                "content": rec.get("content", ""),
+                "score": round(source_score * 0.7, 6),
+                "language": rec_lang,
+                "stale": False,
+                "parent_name": rec.get("parent_name", ""),
+                "cross_layer": True,
+            })
+
+    return cross_layer
+
+
+def _expand_test_files(results: list[dict], storage: Storage) -> list[dict]:
+    """Expand results with associated test files.
+
+    For each result, derives the base filename and searches for test file patterns:
+    {name}_test, test_{name}, {name}.test, {name}.spec.
+
+    Found test chunks are added with test_for=original_file_path,
+    score = source_score * 0.6, at the END of results.
+
+    Deduplicates: skips if already present in results.
+    """
+    existing_fps: set[str] = {r.get("file_path", "") for r in results}
+    test_results: list[dict] = []
+    seen_test_fps: set[str] = set()
+
+    for result in results:
+        fp = result.get("file_path", "")
+        source_score = result.get("score", 0.0)
+
+        if not fp:
+            continue
+
+        base = Path(fp).stem
+        base_lower = base.lower()
+        patterns = [
+            f"{base}_test",
+            f"test_{base}",
+            f"{base}.test",
+            f"{base}.spec",
+        ]
+
+        for pattern in patterns:
+            found = storage.search_fts(pattern, top_k=3)
+            for rec in found:
+                rec_fp = rec.get("file_path", "")
+                if not rec_fp:
+                    continue
+                if rec_fp in existing_fps or rec_fp in seen_test_fps:
+                    continue
+
+                rec_stem = Path(rec_fp).stem.lower()
+                is_test_match = (
+                    rec_stem == f"{base_lower}_test"
+                    or rec_stem == f"test_{base_lower}"
+                    or rec_stem == f"{base_lower}.test"
+                    or rec_stem == f"{base_lower}.spec"
+                )
+                if not is_test_match:
+                    continue
+
+                seen_test_fps.add(rec_fp)
+                test_results.append({
+                    "file_path": rec_fp,
+                    "name": rec.get("name", ""),
+                    "chunk_type": rec.get("chunk_type", ""),
+                    "line_start": rec.get("line_start", 0),
+                    "line_end": rec.get("line_end", 0),
+                    "content": rec.get("content", ""),
+                    "score": round(source_score * 0.6, 6),
+                    "language": rec.get("language", ""),
+                    "stale": False,
+                    "parent_name": rec.get("parent_name", ""),
+                    "test_for": fp,
+                })
+
+    return test_results
+
+
+def _rerank_results(results: list[dict]) -> list[dict]:
+    """Post-process results with diversity and quality heuristics.
+
+    Rules applied in order:
+    1. Short chunk penalty: chunks with < 3 lines get score * 0.5.
+    2. Co-location boost: if 2+ results share the same parent directory,
+       all results from that directory get score * 1.05.
+    3. File diversity: max 2 chunks per file; extras (lowest score) are dropped.
+    4. Re-sort by score descending.
+    """
+    if not results:
+        return results
+
+    # Rule 1: short chunk penalty
+    for r in results:
+        content = r.get("content", "")
+        lines = [ln for ln in content.split("\n") if ln.strip()]
+        if len(lines) < 3:
+            r["score"] = round(r["score"] * 0.5, 6)
+
+    # Rule 2: co-location boost — count results per parent directory
+    dir_counts: dict[str, int] = {}
+    for r in results:
+        fp = r.get("file_path", "")
+        parent = str(Path(fp).parent) if fp else ""
+        dir_counts[parent] = dir_counts.get(parent, 0) + 1
+
+    for r in results:
+        fp = r.get("file_path", "")
+        parent = str(Path(fp).parent) if fp else ""
+        if dir_counts.get(parent, 0) >= 2:
+            r["score"] = round(r["score"] * 1.05, 6)
+
+    # Rule 3: file diversity — keep top 2 per file by score
+    results.sort(key=lambda x: x["score"], reverse=True)
+    file_counts: dict[str, int] = {}
+    kept = []
+    for r in results:
+        fp = r.get("file_path", "")
+        count = file_counts.get(fp, 0)
+        if count < 2:
+            kept.append(r)
+            file_counts[fp] = count + 1
+
+    # Rule 4: re-sort
+    kept.sort(key=lambda x: x["score"], reverse=True)
+    return kept
+
+
 @mcp.tool(
     description=(
         "Search code by natural language query. Returns semantically relevant "
@@ -292,12 +692,12 @@ async def search_semantic(
         else:
             raw_results = _run_original_vector()
 
-            # Build results with stale check; apply score_threshold filter (0.35 for cross-lingual queries)
+            # Build results with stale check; apply score_threshold filter (0.45 for cross-lingual queries)
             results = []
             accepted_raw = []
             for r in raw_results:
                 score = round(1.0 - r.get("_distance", 0.0), 4)
-                if score < 0.35:
+                if score < 0.45:
                     continue
 
                 fp = r.get("file_path", "")
@@ -326,6 +726,27 @@ async def search_semantic(
         # Graph expansion: follow calls_json one hop
         expanded = _expand_via_calls(results, accepted_raw, top_k, storage)
         results = results + expanded
+
+        # Reverse expansion: find callers of each result (1 hop)
+        callers_expanded = _expand_via_callers(results, top_k, storage)
+        results = results + callers_expanded
+
+        # Module clustering: add co-located chunks from directories with 2+ results
+        siblings = _expand_module_siblings(results, top_k, storage, filter_ext=filter_ext)
+        results = results + siblings
+
+        # Cross-layer boost: find matching symbols in other languages
+        cross_layer = _expand_cross_layer(results, storage)
+        results = results + cross_layer
+
+        # Test file association: find test files for source files in results
+        test_files = _expand_test_files(results, storage)
+
+        # Re-ranking heuristic: diversity + quality adjustments
+        results = _rerank_results(results)
+
+        # Test files appended at the END, after reranking
+        results = results + test_files
 
         # Calculate token savings (persists cumulative metrics)
         tokens_saved = calculate_savings(results, repo_path, index_path=storage.index_path)
@@ -967,6 +1388,27 @@ async def search_hybrid(
         # Graph expansion: follow calls_json one hop (results include calls_json from _rrf_merge)
         expanded = _expand_via_calls(results, results, top_k, storage)
         results = results + expanded
+
+        # Reverse expansion: find callers of each result (1 hop)
+        callers_expanded = _expand_via_callers(results, top_k, storage)
+        results = results + callers_expanded
+
+        # Module clustering: add co-located chunks from directories with 2+ results
+        siblings = _expand_module_siblings(results, top_k, storage, filter_ext=filter_ext)
+        results = results + siblings
+
+        # Cross-layer boost: find matching symbols in other languages
+        cross_layer = _expand_cross_layer(results, storage)
+        results = results + cross_layer
+
+        # Test file association: find test files for source files in results
+        test_files = _expand_test_files(results, storage)
+
+        # Re-ranking heuristic: diversity + quality adjustments
+        results = _rerank_results(results)
+
+        # Test files appended at the END, after reranking
+        results = results + test_files
 
         tokens_saved = calculate_savings(results, repo_path, index_path=storage.index_path)
         coverage = _build_coverage(results, storage, query)
