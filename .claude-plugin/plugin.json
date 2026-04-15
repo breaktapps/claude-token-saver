@@ -5,6 +5,6 @@
   "description": "Semantic code search MCP plugin for Claude Code. Reduces token consumption by 70-90% during code exploration by replacing grep/cat cascading with vector search that returns only relevant chunks.",
   "homepage": "https://github.com/breaktapps/claude-token-saver",
   "license": "MIT",
-  "mcp_config": ".mcp.json",
-  "hooks_config": "hooks/hooks.json"
+  "mcpServers": ".mcp.json",
+  "hooks": "hooks/hooks.json"
 }
