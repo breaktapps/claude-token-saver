@@ -4,15 +4,13 @@
       "command": "uv",
       "args": [
         "--directory",
-        "${CLAUDE_PLUGIN_DATA}/claude-token-saver",
+        "${CLAUDE_PLUGIN_ROOT}",
         "run",
         "python",
         "-m",
         "src.server"
       ],
-      "env": {
-        "PLUGIN_DATA_DIR": "${CLAUDE_PLUGIN_DATA}/claude-token-saver"
-      }
+      "env": {}
     }
   }
 }
