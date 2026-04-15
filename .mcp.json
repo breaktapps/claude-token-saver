@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "claude-token-saver": {
+    "cts": {
       "command": "uv",
       "args": [
         "--directory",
