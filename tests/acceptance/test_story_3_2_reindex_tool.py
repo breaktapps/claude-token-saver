@@ -195,28 +195,25 @@ class TestPostToolHookAutoReindex:
         provider = LocalFastembedProvider(config)
         indexer = Indexer(config, storage, provider, repo_path=repo_path)
 
-        # Verify hooks.json exists with PostToolUse hook
+        # Verify hooks.json exists with PostToolUse hook (object format)
         hooks_json = Path(__file__).parent.parent.parent / "hooks" / "hooks.json"
         assert hooks_json.exists(), f"hooks.json not found at {hooks_json}"
 
         import json as json_module
         hooks_config = json_module.loads(hooks_json.read_text())
-        hooks = hooks_config.get("hooks", [])
+        hooks = hooks_config.get("hooks", {})
+        assert isinstance(hooks, dict), "hooks deve ser objeto"
 
-        post_tool_hooks = [h for h in hooks if h.get("event") == "PostToolUse"]
-        assert len(post_tool_hooks) >= 1, "No PostToolUse hook found in hooks.json"
+        assert "PostToolUse" in hooks, "No PostToolUse hook found in hooks.json"
+        post_tool_entries = hooks["PostToolUse"]
+        assert len(post_tool_entries) >= 1
 
-        auto_reindex_hook = next(
-            (h for h in post_tool_hooks if "reindex" in h.get("name", "").lower()),
+        # Verify matcher covers Edit and Write
+        edit_write_entry = next(
+            (e for e in post_tool_entries if "Edit" in str(e.get("matcher", "")) and "Write" in str(e.get("matcher", ""))),
             None
         )
-        assert auto_reindex_hook is not None, "auto-reindex PostToolUse hook not found"
-
-        # Verify it matches Edit and Write
-        matcher = auto_reindex_hook.get("matcher", {})
-        tool_names = matcher.get("tool_name", [])
-        assert "Edit" in tool_names
-        assert "Write" in tool_names
+        assert edit_write_entry is not None, "PostToolUse hook deve cobrir Edit|Write"
 
 
 class TestHookLockHandling:
