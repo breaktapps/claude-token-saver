@@ -78,6 +78,59 @@ def _init_components() -> tuple:
     return _config, _storage, _indexer, _embed_provider, _repo_path
 
 
+def _format_search_response(results: list, tokens_saved: dict, query_time_ms: int,
+                            index_status: str, idx_info: dict) -> str:
+    """Format search results as JSON with a human-readable summary field."""
+    # Build summary for the agent to show the user
+    summary_lines = []
+
+    notice = idx_info.get("notice")
+    if notice:
+        summary_lines.append(notice)
+
+    if not results:
+        summary_lines.append("No results found.")
+    else:
+        for i, r in enumerate(results, 1):
+            name = r.get("name", "")
+            chunk_type = r.get("chunk_type", "")
+            fp = r.get("file_path", "")
+            score = r.get("score", 0)
+            line_start = r.get("line_start", 0)
+            parent = r.get("parent_name", "")
+            parent_info = f" in {parent}" if parent else ""
+            summary_lines.append(
+                f"{i}. {name} ({chunk_type}{parent_info}) — {fp}:{line_start} [score: {score}]"
+            )
+
+    saved = tokens_saved.get("saved", 0)
+    pct = tokens_saved.get("reduction_pct", 0)
+    summary_lines.append(f"Tokens saved: {saved:,} ({pct}% reduction) | Query: {query_time_ms}ms")
+
+    # Truncate content in results to keep response compact
+    compact_results = []
+    for r in results:
+        cr = dict(r)
+        content = cr.get("content", "")
+        content_lines = content.split("\n")
+        if len(content_lines) > 15:
+            cr["content"] = "\n".join(content_lines[:15]) + f"\n... ({len(content_lines) - 15} more lines)"
+        compact_results.append(cr)
+
+    response = {
+        "summary": "\n".join(summary_lines),
+        "results": compact_results,
+        "tokens_saved": tokens_saved,
+        "metadata": {
+            "query_time_ms": query_time_ms,
+            "index_status": index_status,
+            "notice": notice,
+        },
+    }
+
+    return json.dumps(response, ensure_ascii=False)
+
+
 async def _ensure_indexed(indexer: Indexer, storage: Storage) -> dict:
     """Ensure the repository is indexed. Returns dict with status and notice."""
     hashes = storage.get_file_hashes()
@@ -175,17 +228,7 @@ async def search_semantic(
         query_time_ms = int((time.perf_counter() - start) * 1000)
         logger.info("search_semantic: query=%r, results=%d, time=%dms", query, len(results), query_time_ms)
 
-        response = {
-            "results": results,
-            "tokens_saved": tokens_saved,
-            "metadata": {
-                "query_time_ms": query_time_ms,
-                "index_status": index_status,
-                "notice": _idx.get("notice"),
-            },
-        }
-
-        return json.dumps(response, ensure_ascii=False)
+        return _format_search_response(results, tokens_saved, query_time_ms, index_status, _idx)
 
     except CTSError as e:
         return json.dumps({
@@ -326,17 +369,7 @@ async def search_exact(
         query_time_ms = int((time.perf_counter() - start) * 1000)
         logger.info("search_exact: query=%r, results=%d, time=%dms", query, len(results), query_time_ms)
 
-        response = {
-            "results": results,
-            "tokens_saved": tokens_saved,
-            "metadata": {
-                "query_time_ms": query_time_ms,
-                "index_status": index_status,
-                "notice": _idx.get("notice"),
-            },
-        }
-
-        return json.dumps(response, ensure_ascii=False)
+        return _format_search_response(results, tokens_saved, query_time_ms, index_status, _idx)
 
     except CTSError as e:
         return json.dumps({
@@ -697,17 +730,7 @@ async def search_hybrid(
         query_time_ms = int((time.perf_counter() - start) * 1000)
         logger.info("search_hybrid: query=%r, results=%d, time=%dms", query, len(results), query_time_ms)
 
-        response = {
-            "results": results,
-            "tokens_saved": tokens_saved,
-            "metadata": {
-                "query_time_ms": query_time_ms,
-                "index_status": index_status,
-                "notice": _idx.get("notice"),
-            },
-        }
-
-        return json.dumps(response, ensure_ascii=False)
+        return _format_search_response(results, tokens_saved, query_time_ms, index_status, _idx)
 
     except CTSError as e:
         return json.dumps({
