@@ -35,7 +35,14 @@ CACHE_MAXSIZE = 100
 
 
 class EmbeddingProvider(ABC):
-    """Abstract base class for embedding providers."""
+    """Abstract base class for embedding providers.
+
+    Provides a shared LRU cache for embed_query() across all subclasses.
+    Subclasses must implement embed_texts() and _embed_query_uncached().
+    """
+
+    def __init__(self) -> None:
+        self._cache: OrderedDict[str, list[float]] = OrderedDict()
 
     @abstractmethod
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
@@ -43,9 +50,23 @@ class EmbeddingProvider(ABC):
         ...
 
     @abstractmethod
-    def embed_query(self, query: str) -> list[float]:
-        """Embed a single query (with LRU cache)."""
+    def _embed_query_uncached(self, query: str) -> list[float]:
+        """Embed a single query without cache. Implemented by each provider."""
         ...
+
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a single query with LRU cache (shared across all providers)."""
+        if query in self._cache:
+            self._cache.move_to_end(query)
+            return self._cache[query]
+
+        result = self._embed_query_uncached(query)
+
+        if len(self._cache) >= CACHE_MAXSIZE:
+            self._cache.popitem(last=False)
+        self._cache[query] = result
+
+        return result
 
     @abstractmethod
     def dimension(self) -> int:
@@ -57,6 +78,7 @@ class LocalFastembedProvider(EmbeddingProvider):
     """Local embedding provider using fastembed (ONNX Runtime)."""
 
     def __init__(self, config: Config) -> None:
+        super().__init__()
         mode_info = _MODE_MAP.get(config.embedding_mode)
         if mode_info is None:
             raise EmbeddingProviderError(
@@ -68,7 +90,6 @@ class LocalFastembedProvider(EmbeddingProvider):
         self._dimension = mode_info["dimension"]
         self._batch_size = config.batch_size
         self._model = None  # Lazy init on first embed call
-        self._cache: OrderedDict[str, list[float]] = OrderedDict()
 
     def _get_model(self) -> Any:
         """Lazy-load the fastembed model on first use."""
@@ -93,22 +114,9 @@ class LocalFastembedProvider(EmbeddingProvider):
 
         return all_embeddings
 
-    def embed_query(self, query: str) -> list[float]:
-        """Embed a single query with LRU cache."""
-        if query in self._cache:
-            # Move to end (most recently used)
-            self._cache.move_to_end(query)
-            return self._cache[query]
-
-        # Compute embedding
-        result = self.embed_texts([query])[0]
-
-        # Add to cache, evict oldest if full
-        if len(self._cache) >= CACHE_MAXSIZE:
-            self._cache.popitem(last=False)  # Remove oldest
-        self._cache[query] = result
-
-        return result
+    def _embed_query_uncached(self, query: str) -> list[float]:
+        """Embed a single query (no cache). Delegates to embed_texts."""
+        return self.embed_texts([query])[0]
 
     def dimension(self) -> int:
         """Return embedding dimension for current mode."""
@@ -127,6 +135,7 @@ class VoyageProvider(EmbeddingProvider):
     _DEFAULT_DIMENSION = 1536
 
     def __init__(self, config: Config) -> None:
+        super().__init__()
         api_key = os.environ.get("VOYAGE_API_KEY", "")
         if not api_key:
             raise EmbeddingProviderError(
@@ -164,7 +173,7 @@ class VoyageProvider(EmbeddingProvider):
                 "Check VOYAGE_API_KEY and network connectivity."
             ) from exc
 
-    def embed_query(self, query: str) -> list[float]:
+    def _embed_query_uncached(self, query: str) -> list[float]:
         try:
             client = self._get_client()
             result = client.embed([query], model=self._model, input_type="query")
@@ -192,6 +201,7 @@ class OpenAIProvider(EmbeddingProvider):
     _DEFAULT_DIMENSION = 1536
 
     def __init__(self, config: Config) -> None:
+        super().__init__()
         api_key = os.environ.get("OPENAI_API_KEY", "")
         if not api_key:
             raise EmbeddingProviderError(
@@ -229,7 +239,7 @@ class OpenAIProvider(EmbeddingProvider):
                 "Check OPENAI_API_KEY and network connectivity."
             ) from exc
 
-    def embed_query(self, query: str) -> list[float]:
+    def _embed_query_uncached(self, query: str) -> list[float]:
         result = self.embed_texts([query])
         return result[0]
 
@@ -250,9 +260,11 @@ class OllamaProvider(EmbeddingProvider):
     _DEFAULT_DIMENSION = 768  # nomic-embed-text default
 
     def __init__(self, config: Config) -> None:
+        super().__init__()
         self._base_url = os.environ.get("CTS_OLLAMA_URL", self._DEFAULT_URL).rstrip("/")
         self._model = os.environ.get("CTS_OLLAMA_MODEL", self._DEFAULT_MODEL)
         self._dim = self._DEFAULT_DIMENSION
+        self._dim_resolved = False  # True after first actual embed call
 
     def _embed_single(self, text: str) -> list[float]:
         try:
@@ -270,8 +282,9 @@ class OllamaProvider(EmbeddingProvider):
                 response.raise_for_status()
                 data = response.json()
                 embedding = data["embedding"]
-                # Update dimension from actual response
+                # Update dimension from actual response and mark as resolved
                 self._dim = len(embedding)
+                self._dim_resolved = True
                 return embedding
         except EmbeddingProviderError:
             raise
@@ -286,10 +299,13 @@ class OllamaProvider(EmbeddingProvider):
             return []
         return [self._embed_single(t) for t in texts]
 
-    def embed_query(self, query: str) -> list[float]:
+    def _embed_query_uncached(self, query: str) -> list[float]:
         return self._embed_single(query)
 
     def dimension(self) -> int:
+        """Return embedding dimension, performing a warmup call if not yet resolved."""
+        if not self._dim_resolved:
+            self._embed_single("")
         return self._dim
 
 

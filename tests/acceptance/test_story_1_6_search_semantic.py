@@ -11,7 +11,6 @@ NFRs: NFR1 (<500ms), NFR12 (MCP stdio)
 import json
 import shutil
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -300,40 +299,60 @@ class TestMcpRegistration:
         assert "USE INSTEAD OF Grep" in tool.description
 
 
+class _FailingEmbedProvider:
+    """Stub embed provider that always raises EmbeddingProviderError."""
+
+    def __init__(self, message: str):
+        self._message = message
+
+    def embed_query(self, query: str):
+        raise EmbeddingProviderError(self._message)
+
+    def embed_batch(self, texts):
+        raise EmbeddingProviderError(self._message)
+
+
+class _CrashingEmbedProvider:
+    """Stub embed provider that raises an unexpected RuntimeError."""
+
+    def embed_query(self, query: str):
+        raise RuntimeError("unexpected crash")
+
+    def embed_batch(self, texts):
+        raise RuntimeError("unexpected crash")
+
+
 class TestErrorHandling:
     """AC: Given an internal exception occurs,
     When tool handler catches it, Then JSON error response is returned."""
 
     @pytest.mark.asyncio
-    async def test_exception_returns_json_error_with_suggestion(self):
+    async def test_exception_returns_json_error_with_suggestion(self, indexed):
         """Excecao interna deve retornar { error, suggestion } JSON."""
         import src.server as srv
 
+        config, storage, indexer, provider, repo = indexed
+
+        old_provider = srv._embed_provider
         old_config = srv._config
         old_storage = srv._storage
         old_indexer = srv._indexer
-        old_provider = srv._embed_provider
         old_repo = srv._repo_path
 
         try:
-            # Set up broken provider
-            srv._config = _make_config()
-            srv._repo_path = Path("/nonexistent")
-            srv._storage = None  # Will cause error
-            srv._embed_provider = None
-            srv._indexer = None
+            srv._config = config
+            srv._storage = storage
+            srv._indexer = indexer
+            srv._repo_path = repo
+            # Inject a provider that raises EmbeddingProviderError
+            srv._embed_provider = _FailingEmbedProvider("model not found")
 
-            # Force re-init with broken state
-            srv._config = None  # Reset to force _init_components
+            result_json = await search_semantic("test query")
+            response = json.loads(result_json)
 
-            # Use a mock that raises
-            with patch.object(srv, '_init_components', side_effect=EmbeddingProviderError("model not found")):
-                result_json = await search_semantic("test query")
-                response = json.loads(result_json)
-
-                assert "error" in response
-                assert "suggestion" in response
-                assert "model not found" in response["error"]
+            assert "error" in response
+            assert "suggestion" in response
+            assert "model not found" in response["error"]
         finally:
             srv._config = old_config
             srv._storage = old_storage
@@ -342,19 +361,33 @@ class TestErrorHandling:
             srv._repo_path = old_repo
 
     @pytest.mark.asyncio
-    async def test_exception_never_escapes_to_mcp_protocol(self):
+    async def test_exception_never_escapes_to_mcp_protocol(self, indexed):
         """Excecao nunca deve escapar para o protocolo MCP."""
         import src.server as srv
 
+        config, storage, indexer, provider, repo = indexed
+
+        old_provider = srv._embed_provider
         old_config = srv._config
+        old_storage = srv._storage
+        old_indexer = srv._indexer
+        old_repo = srv._repo_path
 
         try:
-            srv._config = None
+            srv._config = config
+            srv._storage = storage
+            srv._indexer = indexer
+            srv._repo_path = repo
+            # Inject a provider that raises an unexpected RuntimeError
+            srv._embed_provider = _CrashingEmbedProvider()
 
-            with patch.object(srv, '_init_components', side_effect=RuntimeError("unexpected")):
-                # Should NOT raise, should return JSON error
-                result_json = await search_semantic("test")
-                response = json.loads(result_json)
-                assert "error" in response
+            # Should NOT raise, should return JSON error
+            result_json = await search_semantic("test")
+            response = json.loads(result_json)
+            assert "error" in response
         finally:
             srv._config = old_config
+            srv._storage = old_storage
+            srv._indexer = old_indexer
+            srv._embed_provider = old_provider
+            srv._repo_path = old_repo

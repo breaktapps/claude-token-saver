@@ -57,7 +57,7 @@ class Indexer:
         return self._repo_path
 
     async def reindex(self, *, force: bool = False) -> dict:
-        """Run the full indexation pipeline.
+        """Run the full indexation pipeline without blocking the event loop.
 
         Args:
             force: If True, delete all existing chunks and rebuild from scratch.
@@ -68,6 +68,13 @@ class Indexer:
             Stats dict with files_scanned, files_indexed, chunks_created,
             files_updated, files_deleted, files_added, duration_ms, languages.
         """
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._reindex_sync, force)
+
+    def _reindex_sync(self, force: bool = False) -> dict:
+        """Synchronous implementation of the full indexation pipeline."""
         start_time = time.monotonic()
 
         # Step 1: Scan current files on disk

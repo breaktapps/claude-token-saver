@@ -127,7 +127,8 @@ def parse(
 
     Returns:
         List of chunk dicts with: file_path, chunk_type, name, line_start,
-        line_end, content, language, parent_name, calls_json, outline_json.
+        line_end, content, language, parent_name, calls_json, outline_json,
+        imports_json.
     """
     source = file_path.read_text()
     if not source.strip():
@@ -209,6 +210,23 @@ _INTERFACE_TYPES = {
     "typescript": ["interface_declaration"],
 }
 
+# Import node types per language
+_IMPORT_TYPES = {
+    "python": ["import_statement", "import_from_statement"],
+    "typescript": ["import_statement"],
+    "javascript": ["import_statement"],
+}
+
+
+def _extract_imports(root: Node, language: str, source: str) -> list[str]:
+    """Extract import strings from the root AST node."""
+    import_types = _IMPORT_TYPES.get(language, [])
+    imports: list[str] = []
+    for child in root.children:
+        if child.type in import_types:
+            imports.append(child.text.decode().strip())
+    return imports
+
 
 def _parse_tree_sitter(
     source: str,
@@ -222,6 +240,9 @@ def _parse_tree_sitter(
     root = tree.root_node
     lines = source.split("\n")
 
+    # Extract imports from the source
+    imports = _extract_imports(root, language, source)
+
     chunks: list[dict] = []
     class_types = _CLASS_TYPES.get(language, [])
     func_types = _FUNCTION_TYPES.get(language, [])
@@ -231,33 +252,50 @@ def _parse_tree_sitter(
     for child in root.children:
         if child.type in class_types:
             chunks.extend(
-                _extract_class_chunks(child, file_path, language, lines, max_chunk_lines)
+                _extract_class_chunks(child, file_path, language, lines, max_chunk_lines, imports)
             )
         elif child.type in func_types:
             chunks.extend(
-                _extract_function_chunk(child, file_path, language, lines, None, max_chunk_lines)
+                _extract_function_chunk(child, file_path, language, lines, None, max_chunk_lines, imports)
             )
         elif child.type in export_types:
-            # Unwrap export statement
+            # Unwrap export statement — handle export default anonymous (M8)
+            default_name = _export_default_name(child, file_path)
             for inner in child.children:
                 if inner.type in func_types:
+                    # M8: use filename-based name if function is anonymous
+                    name_override = default_name if _get_node_name(inner, language) == "<anonymous>" else None
                     chunks.extend(
-                        _extract_function_chunk(inner, file_path, language, lines, None, max_chunk_lines)
+                        _extract_function_chunk(
+                            inner, file_path, language, lines, None, max_chunk_lines, imports,
+                            name_override=name_override,
+                        )
                     )
                 elif inner.type in class_types:
                     chunks.extend(
-                        _extract_class_chunks(inner, file_path, language, lines, max_chunk_lines)
+                        _extract_class_chunks(inner, file_path, language, lines, max_chunk_lines, imports)
                     )
                 elif inner.type in interface_types:
                     chunks.extend(
-                        _extract_interface_chunk(inner, file_path, language, lines)
+                        _extract_interface_chunk(inner, file_path, language, lines, imports)
                     )
         elif child.type in interface_types:
             chunks.extend(
-                _extract_interface_chunk(child, file_path, language, lines)
+                _extract_interface_chunk(child, file_path, language, lines, imports)
             )
 
     return chunks
+
+
+def _export_default_name(export_node: Node, file_path: str) -> str:
+    """Return a fallback name for 'export default' anonymous functions/classes.
+
+    Uses the stem of the file name (e.g. 'index' from 'index.ts').
+    """
+    for child in export_node.children:
+        if child.type == "identifier":
+            return child.text.decode()
+    return Path(file_path).stem
 
 
 def _extract_class_chunks(
@@ -266,6 +304,7 @@ def _extract_class_chunks(
     language: str,
     lines: list[str],
     max_chunk_lines: int,
+    imports: list[str] | None = None,
 ) -> list[dict]:
     """Extract class outline + method chunks from a class node."""
     chunks = []
@@ -301,13 +340,14 @@ def _extract_class_chunks(
         "parent_name": "",
         "calls_json": "[]",
         "outline_json": json.dumps(member_signatures),
+        "imports_json": json.dumps(imports or []),
     })
 
     # Method chunks
     for method_node in methods:
         chunks.extend(
             _extract_function_chunk(
-                method_node, file_path, language, lines, class_name, max_chunk_lines
+                method_node, file_path, language, lines, class_name, max_chunk_lines, imports
             )
         )
 
@@ -321,9 +361,12 @@ def _extract_function_chunk(
     lines: list[str],
     parent_name: str | None,
     max_chunk_lines: int,
+    imports: list[str] | None = None,
+    *,
+    name_override: str | None = None,
 ) -> list[dict]:
     """Extract function/method chunk(s), splitting if too large."""
-    name = _get_node_name(node, language)
+    name = name_override or _get_node_name(node, language)
     start_line = node.start_point[0] + 1
     end_line = node.end_point[0] + 1
     content = _get_node_text(node, lines)
@@ -343,11 +386,12 @@ def _extract_function_chunk(
             "parent_name": parent_name or "",
             "calls_json": json.dumps(calls),
             "outline_json": "[]",
+            "imports_json": json.dumps(imports or []),
         }]
 
     # Split large method at first-level AST nodes
     return _split_large_chunk(
-        node, file_path, language, lines, name, parent_name, chunk_type, calls, max_chunk_lines
+        node, file_path, language, lines, name, parent_name, chunk_type, calls, max_chunk_lines, imports
     )
 
 
@@ -361,6 +405,7 @@ def _split_large_chunk(
     chunk_type: str,
     calls: list[str],
     max_chunk_lines: int,
+    imports: list[str] | None = None,
 ) -> list[dict]:
     """Split a large function/method into sub-chunks at first-level AST nodes."""
     body = _find_body(node, language)
@@ -378,6 +423,7 @@ def _split_large_chunk(
             "parent_name": parent_name or "",
             "calls_json": json.dumps(calls),
             "outline_json": "[]",
+            "imports_json": json.dumps(imports or []),
         }]
 
     # Get the signature (everything before the body)
@@ -398,7 +444,7 @@ def _split_large_chunk(
             # Emit current group
             chunks.append(_make_sub_chunk(
                 current_children, lines, file_path, chunk_type, name, part,
-                parent_name, language, calls
+                parent_name, language, calls, imports
             ))
             part += 1
             current_children = []
@@ -410,7 +456,7 @@ def _split_large_chunk(
     if current_children:
         chunks.append(_make_sub_chunk(
             current_children, lines, file_path, chunk_type, name, part,
-            parent_name, language, calls
+            parent_name, language, calls, imports
         ))
 
     return chunks
@@ -426,6 +472,7 @@ def _make_sub_chunk(
     parent_name: str | None,
     language: str,
     calls: list[str],
+    imports: list[str] | None = None,
 ) -> dict:
     """Create a sub-chunk dict from a group of AST nodes."""
     start_line = children[0].start_point[0] + 1
@@ -443,6 +490,7 @@ def _make_sub_chunk(
         "parent_name": parent_name or "",
         "calls_json": json.dumps(calls),
         "outline_json": "[]",
+        "imports_json": json.dumps(imports or []),
     }
 
 
@@ -451,6 +499,7 @@ def _extract_interface_chunk(
     file_path: str,
     language: str,
     lines: list[str],
+    imports: list[str] | None = None,
 ) -> list[dict]:
     """Extract an interface as a class-like outline chunk."""
     name = _get_node_name(node, language)
@@ -473,6 +522,7 @@ def _extract_interface_chunk(
         "parent_name": "",
         "calls_json": "[]",
         "outline_json": json.dumps(members),
+        "imports_json": json.dumps(imports or []),
     }]
 
 
@@ -575,6 +625,8 @@ _DART_FUNC_RE = re.compile(
 
 _DART_CALL_RE = re.compile(r"(\w+)\s*\(")
 
+_DART_IMPORT_RE = re.compile(r"^import\s+'([^']+)'", re.MULTILINE)
+
 
 def _parse_dart(
     source: str,
@@ -585,6 +637,12 @@ def _parse_dart(
     lines = source.split("\n")
     chunks: list[dict] = []
 
+    # C2: Extract imports
+    imports = [m.group(0).strip() for m in _DART_IMPORT_RE.finditer(source)]
+
+    # Build a set of line ranges covered by classes to detect top-level functions
+    class_ranges: list[tuple[int, int]] = []
+
     # Find classes
     for match in _DART_CLASS_RE.finditer(source):
         class_name = match.group(1)
@@ -592,6 +650,7 @@ def _parse_dart(
         # Find matching closing brace
         class_end = _find_closing_brace(source, match.end() - 1)
         class_end_line = source[:class_end + 1].count("\n")
+        class_ranges.append((class_start, class_end_line))
 
         class_source = "\n".join(lines[class_start: class_end_line + 1])
 
@@ -622,6 +681,7 @@ def _parse_dart(
                 "parent_name": class_name,
                 "calls_json": json.dumps(calls),
                 "outline_json": "[]",
+                "imports_json": json.dumps(imports),
             })
 
         # Class outline
@@ -640,25 +700,88 @@ def _parse_dart(
             "parent_name": "",
             "calls_json": "[]",
             "outline_json": json.dumps(member_sigs),
+            "imports_json": json.dumps(imports),
         })
         chunks.extend(method_chunks)
+
+    # C5: Extract top-level functions (not inside any class)
+    for match in _DART_FUNC_RE.finditer(source):
+        func_name = match.group(1)
+        func_start_line = source[:match.start()].count("\n")
+
+        # Skip if this match is inside a known class range
+        if any(cs <= func_start_line <= ce for cs, ce in class_ranges):
+            continue
+
+        brace_pos = source.index("{", match.start())
+        func_end_pos = _find_closing_brace(source, brace_pos)
+        func_end_line = source[:func_end_pos + 1].count("\n")
+
+        func_text = "\n".join(lines[func_start_line: func_end_line + 1])
+        calls = _extract_dart_calls(func_text)
+
+        chunks.append({
+            "file_path": file_path,
+            "chunk_type": "function",
+            "name": func_name,
+            "line_start": func_start_line + 1,
+            "line_end": func_end_line + 1,
+            "content": func_text,
+            "language": "dart",
+            "parent_name": "",
+            "calls_json": json.dumps(calls),
+            "outline_json": "[]",
+            "imports_json": json.dumps(imports),
+        })
 
     return chunks
 
 
 def _find_closing_brace(source: str, open_pos: int) -> int:
-    """Find the matching closing brace for an opening brace."""
+    """Find the matching closing brace for an opening brace.
+
+    Skips braces inside single-line comments (//), block comments (/* */),
+    and string literals (single and double quotes).
+    """
     depth = 0
     i = open_pos
-    while i < len(source):
-        if source[i] == "{":
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        # Single-line comment: skip to end of line
+        if ch == "/" and i + 1 < n and source[i + 1] == "/":
+            i += 2
+            while i < n and source[i] != "\n":
+                i += 1
+            continue
+        # Block comment: skip to */
+        if ch == "/" and i + 1 < n and source[i + 1] == "*":
+            i += 2
+            while i < n - 1 and not (source[i] == "*" and source[i + 1] == "/"):
+                i += 1
+            i += 2  # skip */
+            continue
+        # String literal (single or double quote, non-multiline)
+        if ch in ('"', "'"):
+            quote = ch
+            i += 1
+            while i < n:
+                if source[i] == "\\":
+                    i += 2  # skip escaped char
+                    continue
+                if source[i] == quote:
+                    break
+                i += 1
+            i += 1
+            continue
+        if ch == "{":
             depth += 1
-        elif source[i] == "}":
+        elif ch == "}":
             depth -= 1
             if depth == 0:
                 return i
         i += 1
-    return len(source) - 1
+    return n - 1
 
 
 def _extract_dart_calls(source: str) -> list[str]:

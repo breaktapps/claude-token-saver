@@ -8,9 +8,9 @@ FRs: FR15 (git hook post-commit)
 """
 
 import json
+import os
 import shutil
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -61,19 +61,13 @@ class TestGitPostCommitHook:
         """Reindex incremental deve ser triggerado apos git commit."""
         config, storage, indexer, provider, repo = indexed
 
-        reindex_calls = []
-        original_reindex = indexer.reindex
+        # Simulate hook triggering incremental reindex (force=False)
+        stats = await indexer.reindex(force=False)
 
-        async def tracking_reindex(force=False):
-            reindex_calls.append(force)
-            return await original_reindex(force=force)
-
-        with patch.object(indexer, "reindex", side_effect=tracking_reindex):
-            # Simulate hook triggering incremental reindex
-            await indexer.reindex(force=False)
-
-        assert len(reindex_calls) == 1
-        assert reindex_calls[0] is False  # incremental, not full rebuild
+        # Incremental reindex runs without error and returns expected keys
+        assert "files_scanned" in stats
+        assert "files_updated" in stats
+        assert "files_deleted" in stats
 
     @pytest.mark.asyncio
     async def test_only_committed_files_reindexed(self, indexed):
@@ -106,16 +100,19 @@ class TestGitHookLockHandling:
 
         config, storage, indexer, provider, repo = indexed
 
-        # Simulate a held lock
+        # Hold the lock via fcntl.flock to simulate contention
+        import fcntl
         lock_path = storage._lock_path
-        lock_path.touch()
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         try:
             with pytest.raises(LockTimeoutError):
                 with storage._acquire_lock(timeout=0.1):
                     pass  # Lock already held -- should timeout quickly
         finally:
-            lock_path.unlink(missing_ok=True)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
         # Index must be intact after lock timeout
         hashes = storage.get_file_hashes()

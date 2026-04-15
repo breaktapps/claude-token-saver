@@ -7,16 +7,40 @@ cumulative metrics display, no-index error, and MCP registration.
 FRs: FR20 (global index stats), FR21 (per-file chunk inspection), FR22 (stale indicator)
 """
 
+import contextlib
 import hashlib
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 import src.server as server_module
 from src.metrics import _save_metrics
 from src.storage import Storage
+
+
+@contextlib.contextmanager
+def _inject_server_state(config, storage, repo_path):
+    """Context manager: inject real components into server globals, restore after."""
+    old_config = server_module._config
+    old_storage = server_module._storage
+    old_indexer = server_module._indexer
+    old_provider = server_module._embed_provider
+    old_repo = server_module._repo_path
+
+    server_module._config = config
+    server_module._storage = storage
+    server_module._indexer = None
+    server_module._embed_provider = None
+    server_module._repo_path = repo_path
+    try:
+        yield
+    finally:
+        server_module._config = old_config
+        server_module._storage = old_storage
+        server_module._indexer = old_indexer
+        server_module._embed_provider = old_provider
+        server_module._repo_path = old_repo
 
 
 def _make_storage_with_chunks(tmp_path, chunks: list[dict], config=None):
@@ -52,7 +76,7 @@ def _fake_chunk(file_path="src/a.py", language="python", chunk_type="function",
 
 @pytest.fixture()
 def mock_components(tmp_path):
-    """Patch _init_components to return controlled mocks."""
+    """Inject real Storage and Config into server globals for controlled testing."""
     from src.config import Config
     config = Config()
     repo_path = tmp_path / "repo"
@@ -62,11 +86,7 @@ def mock_components(tmp_path):
         _fake_chunk("src/b.py", language="dart", name="bar", file_hash="hash_b"),
     ])
 
-    indexer = MagicMock()
-    embed_provider = MagicMock()
-
-    with patch.object(server_module, "_init_components",
-                      return_value=(config, storage, indexer, embed_provider, repo_path)):
+    with _inject_server_state(config, storage, repo_path):
         yield storage, repo_path
 
 
@@ -164,11 +184,8 @@ class TestStaleFilesReporting:
             for i in range(3)
         ]
         storage = _make_storage_with_chunks(tmp_path, chunks)
-        indexer = MagicMock()
-        embed_provider = MagicMock()
 
-        with patch.object(server_module, "_init_components",
-                          return_value=(config, storage, indexer, embed_provider, repo_path)):
+        with _inject_server_state(config, storage, repo_path):
             result = json.loads(await server_module.inspect_index())
 
         # All 3 files are stale because "old_hash" != current hash (files don't exist)
@@ -187,11 +204,8 @@ class TestStaleFilesReporting:
             _fake_chunk("src/stale2.py", file_hash="old_hash2", name="fn2"),
         ]
         storage = _make_storage_with_chunks(tmp_path, chunks)
-        indexer = MagicMock()
-        embed_provider = MagicMock()
 
-        with patch.object(server_module, "_init_components",
-                          return_value=(config, storage, indexer, embed_provider, repo_path)):
+        with _inject_server_state(config, storage, repo_path):
             result = json.loads(await server_module.inspect_index())
 
         assert "stale_files" in result
@@ -224,11 +238,7 @@ class TestCumulativeMetricsDisplay:
             "last_updated": "2026-04-14T12:00:00",
         })
 
-        indexer = MagicMock()
-        embed_provider = MagicMock()
-
-        with patch.object(server_module, "_init_components",
-                          return_value=(config, storage, indexer, embed_provider, repo_path)):
+        with _inject_server_state(config, storage, repo_path):
             result = json.loads(await server_module.inspect_index())
 
         assert result["tokens_saved_total"] == 99999
@@ -249,11 +259,8 @@ class TestNoIndexError:
 
         # Storage with NO chunks
         storage = _make_storage_with_chunks(tmp_path, [])
-        indexer = MagicMock()
-        embed_provider = MagicMock()
 
-        with patch.object(server_module, "_init_components",
-                          return_value=(config, storage, indexer, embed_provider, repo_path)):
+        with _inject_server_state(config, storage, repo_path):
             result = json.loads(await server_module.inspect_index())
 
         assert "error" in result

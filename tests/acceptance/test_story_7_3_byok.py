@@ -8,6 +8,9 @@ FRs: FR25 (BYOK providers: Voyage, OpenAI, Ollama)
 NFRs: NFR10 (code leaves machine only with explicit BYOK config)
 """
 
+# Mock justified: external APIs (Voyage AI, OpenAI, Ollama/httpx) require network
+# and real API keys. Tests verify the integration layer (client init, response parsing,
+# error propagation) without making actual HTTP calls.
 from unittest.mock import MagicMock, patch
 
 import pytest

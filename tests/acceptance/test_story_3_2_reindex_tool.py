@@ -269,17 +269,19 @@ class TestHookLockHandling:
 
         await indexer.reindex()
 
-        # Hold the lock permanently to simulate timeout
+        # Hold the lock via fcntl.flock to simulate contention
+        import fcntl
         lock_path = storage.index_path / "index.lock"
-        lock_path.touch()
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         try:
             # Attempt to delete a file (which acquires lock) — should raise LockTimeoutError
             with pytest.raises(LockTimeoutError):
                 storage.delete_file(str(repo_path / "src" / "module.py"))
         finally:
-            if lock_path.exists():
-                lock_path.unlink()
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
         # Index should still be intact (not corrupted)
         hashes = storage.get_file_hashes()

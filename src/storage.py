@@ -6,6 +6,7 @@ and index path resolution. LanceDB is the only storage backend.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import time
@@ -28,6 +29,14 @@ EMBEDDING_DIMS = {
 # Default lock timeout in seconds
 LOCK_TIMEOUT = 10
 LOCK_POLL_INTERVAL = 0.5
+
+
+def _escape_sql(value: str) -> str:
+    """Escape a string value for safe use in SQL WHERE clauses.
+
+    Replaces single quotes with two single quotes (SQL standard escaping).
+    """
+    return value.replace("'", "''")
 
 
 def _compute_repo_hash(repo_path: Path) -> str:
@@ -56,6 +65,7 @@ def _build_schema(dim: int) -> pa.Schema:
         pa.field("parent_name", pa.string()),
         pa.field("calls_json", pa.string()),
         pa.field("outline_json", pa.string()),
+        pa.field("imports", pa.list_(pa.string())),
     ])
 
 
@@ -126,32 +136,35 @@ class Storage:
 
     @contextmanager
     def _acquire_lock(self, timeout: float = LOCK_TIMEOUT):
-        """Acquire file lock with timeout.
+        """Acquire file lock with timeout using fcntl.flock().
+
+        Unlike O_CREAT|O_EXCL, flock locks are released automatically by the OS
+        when the process dies, preventing orphaned lock files.
 
         Raises:
             LockTimeoutError: If lock cannot be acquired within timeout.
         """
+        fd = os.open(str(self._lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
         start = time.monotonic()
-        while True:
-            try:
-                fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)
-                break
-            except FileExistsError:
-                elapsed = time.monotonic() - start
-                if elapsed >= timeout:
-                    raise LockTimeoutError(
-                        f"Could not acquire lock after {timeout}s. "
-                        "Another operation may be in progress."
-                    )
-                time.sleep(LOCK_POLL_INTERVAL)
         try:
-            yield
-        finally:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    elapsed = time.monotonic() - start
+                    if elapsed >= timeout:
+                        raise LockTimeoutError(
+                            f"Could not acquire lock after {timeout}s. "
+                            "Another operation may be in progress."
+                        )
+                    time.sleep(LOCK_POLL_INTERVAL)
             try:
-                self._lock_path.unlink()
-            except FileNotFoundError:
-                pass
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def upsert(self, chunks: list[dict]) -> None:
         """Insert or update chunks in the table.
@@ -168,7 +181,7 @@ class Storage:
             file_paths = {c["file_path"] for c in chunks}
             for fp in file_paths:
                 try:
-                    table.delete(f"file_path = '{fp}'")
+                    table.delete(f"file_path = '{_escape_sql(fp)}'")
                 except Exception:
                     pass  # Table may be empty or file_path not found
 
@@ -255,7 +268,7 @@ class Storage:
         try:
             results = (
                 table.search()
-                .where(f"file_path = '{file_path}'")
+                .where(f"file_path = '{_escape_sql(file_path)}'")
                 .select(["file_hash"])
                 .limit(1)
                 .to_list()
@@ -300,7 +313,7 @@ class Storage:
         try:
             results = (
                 table.search()
-                .where(f"file_path = '{file_path}'")
+                .where(f"file_path = '{_escape_sql(file_path)}'")
                 .select(["name", "chunk_type", "line_start", "line_end", "file_hash"])
                 .to_list()
             )
@@ -314,7 +327,7 @@ class Storage:
         try:
             results = (
                 table.search()
-                .where(f"file_path = '{file_path}'")
+                .where(f"file_path = '{_escape_sql(file_path)}'")
                 .select([
                     "file_path", "chunk_type", "name", "line_start", "line_end",
                     "content", "language", "file_hash", "parent_name", "calls_json",
@@ -330,7 +343,7 @@ class Storage:
         with self._acquire_lock():
             table = self._get_or_create_table()
             try:
-                table.delete(f"file_path = '{file_path}'")
+                table.delete(f"file_path = '{_escape_sql(file_path)}'")
             except Exception:
                 pass
 
@@ -339,8 +352,8 @@ class Storage:
         """Build SQL WHERE clause from filters."""
         clauses = []
         if filter_ext:
-            ext = filter_ext.lstrip(".")
+            ext = _escape_sql(filter_ext.lstrip("."))
             clauses.append(f"file_path LIKE '%.{ext}'")
         if filter_path:
-            clauses.append(f"file_path LIKE '{filter_path}%'")
+            clauses.append(f"file_path LIKE '{_escape_sql(filter_path)}%'")
         return " AND ".join(clauses) if clauses else None

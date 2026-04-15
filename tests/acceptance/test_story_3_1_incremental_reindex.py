@@ -320,6 +320,8 @@ class TestIncrementalReindexLock:
     @pytest.mark.asyncio
     async def test_lock_timeout_on_concurrent_reindex(self, tmp_path):
         """Reindex concorrente deve esperar e levantar LockTimeoutError."""
+        import fcntl
+
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / ".git").mkdir()
@@ -335,53 +337,17 @@ class TestIncrementalReindexLock:
         # Index once to have data
         await indexer.reindex()
 
-        # Manually create the lock file to simulate another operation holding it
+        # Hold an exclusive flock to simulate another process holding the lock
         lock_path = storage.index_path / "index.lock"
-        lock_path.touch()
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
 
         try:
             with pytest.raises(LockTimeoutError):
-                # Modify file to trigger upsert (which needs the lock)
-                (src / "mod.py").write_text("def f_modified(): return 99\n")
-                # Use very short timeout to avoid waiting 10s in tests
-                # We patch the timeout by directly calling upsert
-                storage._acquire_lock.__func__  # verify it's a context manager
-                # Call delete_file which acquires lock internally
-                storage.delete_file(str(src / "mod.py"))
-        finally:
-            # Clean up lock file
-            if lock_path.exists():
-                lock_path.unlink()
-
-        # Verify that with a custom short timeout, LockTimeoutError is raised
-        lock_path.touch()
-        try:
-            import contextlib
-
-            @contextlib.contextmanager
-            def fast_lock():
-                start = time.monotonic()
-                while True:
-                    try:
-                        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                        os.close(fd)
-                        break
-                    except FileExistsError:
-                        elapsed = time.monotonic() - start
-                        if elapsed >= 0.5:
-                            raise LockTimeoutError("Lock timeout in test")
-                        time.sleep(0.1)
-                try:
-                    yield
-                finally:
-                    try:
-                        lock_path.unlink()
-                    except FileNotFoundError:
-                        pass
-
-            with pytest.raises(LockTimeoutError):
-                with fast_lock():
+                # delete_file acquires the lock internally; use short timeout via monkeypatching
+                with storage._acquire_lock(timeout=0.5):
                     pass
         finally:
-            if lock_path.exists():
-                lock_path.unlink()
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            lock_path.unlink(missing_ok=True)

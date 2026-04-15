@@ -159,6 +159,69 @@ class TestLargeMethodSplitting:
             assert not first_line.startswith(("else:", "elif ", "except", "finally:"))
 
 
+class TestDartTopLevelFunctions:
+    """C5: Dart top-level functions devem ser extraidas como chunks de funcao."""
+
+    def test_top_level_functions_extracted(self):
+        """Funcoes top-level Dart devem virar chunks com chunk_type='function'."""
+        chunks = parse(FIXTURES / "dart" / "utils_with_functions.dart", "dart")
+        func_chunks = [c for c in chunks if c["chunk_type"] == "function"]
+        func_names = {c["name"] for c in func_chunks}
+        assert "formatDate" in func_names
+        assert "clamp" in func_names
+
+    def test_top_level_functions_not_inside_class(self):
+        """Funcoes top-level nao devem ter parent_name."""
+        chunks = parse(FIXTURES / "dart" / "utils_with_functions.dart", "dart")
+        func_chunks = [c for c in chunks if c["chunk_type"] == "function"]
+        for fc in func_chunks:
+            assert fc["parent_name"] == ""
+
+    def test_class_methods_not_duplicated_as_functions(self):
+        """Metodos de classe nao devem aparecer como funcoes top-level."""
+        chunks = parse(FIXTURES / "dart" / "utils_with_functions.dart", "dart")
+        func_chunks = [c for c in chunks if c["chunk_type"] == "function"]
+        func_names = {c["name"] for c in func_chunks}
+        # 'format' is a method inside DateHelper, not a top-level function
+        assert "format" not in func_names
+
+
+class TestImportsExtraction:
+    """C2: Imports devem ser extraidos e incluidos nos chunks como imports_json."""
+
+    def test_dart_imports_extracted(self):
+        """Imports Dart devem estar em imports_json de todos os chunks do arquivo."""
+        chunks = parse(FIXTURES / "dart" / "utils_with_functions.dart", "dart")
+        assert len(chunks) > 0
+        for chunk in chunks:
+            assert "imports_json" in chunk
+            imports = json.loads(chunk["imports_json"])
+            assert isinstance(imports, list)
+            assert any("dart:convert" in imp for imp in imports)
+            assert any("flutter/material" in imp for imp in imports)
+
+    def test_python_imports_extracted(self):
+        """Imports Python devem estar em imports_json dos chunks."""
+        chunks = parse(FIXTURES / "python" / "data_processor.py", "python")
+        assert len(chunks) > 0
+        for chunk in chunks:
+            assert "imports_json" in chunk
+            imports = json.loads(chunk["imports_json"])
+            assert isinstance(imports, list)
+            assert any("import json" in imp for imp in imports)
+            assert any("pathlib" in imp for imp in imports)
+
+    def test_typescript_imports_extracted(self):
+        """Imports TypeScript devem estar em imports_json dos chunks."""
+        # api_handler.ts nao tem imports, mas verificamos que o campo existe
+        chunks = parse(FIXTURES / "typescript" / "api_handler.ts", "typescript")
+        assert len(chunks) > 0
+        for chunk in chunks:
+            assert "imports_json" in chunk
+            imports = json.loads(chunk["imports_json"])
+            assert isinstance(imports, list)
+
+
 class TestLanguageDetection:
     """AC: Given a file with extension .dart,
     When detect_language is called, Then returns 'dart'."""

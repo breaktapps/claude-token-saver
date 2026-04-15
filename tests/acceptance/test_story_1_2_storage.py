@@ -256,35 +256,41 @@ class TestFileLock:
 
     def test_lock_timeout_raises_error(self, storage):
         """Segunda operacao deve receber LockTimeoutError apos timeout."""
-        # Manually create the lock file to simulate held lock
+        import fcntl
+
         lock_path = storage.index_path / "index.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
+        # Hold an exclusive flock on the lock file to block _acquire_lock
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             with pytest.raises(LockTimeoutError):
                 # Use a very short timeout to not slow down tests
                 with storage._acquire_lock(timeout=0.5):
                     pass
         finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
             lock_path.unlink(missing_ok=True)
 
     def test_concurrent_access_waits_for_lock(self, storage):
         """Operacao concorrente deve esperar pelo lock antes de prosseguir."""
+        import fcntl
         import threading
 
         lock_path = storage.index_path / "index.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Create lock file first
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
+        # Hold an exclusive flock to block the acquirer thread
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
 
         acquired = threading.Event()
 
         def release_lock_after_delay():
             time.sleep(0.3)
-            lock_path.unlink(missing_ok=True)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
         def try_acquire():
             with storage._acquire_lock(timeout=2.0):
@@ -300,6 +306,7 @@ class TestFileLock:
         acquirer.join(timeout=5.0)
         releaser.join(timeout=5.0)
 
+        lock_path.unlink(missing_ok=True)
         assert acquired.is_set(), "Lock should have been acquired after release"
 
 

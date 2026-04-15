@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from .config import Config
 from .embeddings import create_embedding_provider
 from .errors import CTSError
-from .indexer import Indexer, _compute_file_hash
+from .indexer import Indexer, _compute_file_hash, _find_repo_root
 from .metrics import _load_metrics, calculate_savings
 from .storage import Storage
 
@@ -67,16 +67,6 @@ def _init_components() -> tuple:
     return _config, _storage, _indexer, _embed_provider, _repo_path
 
 
-def _find_repo_root(start: Path) -> Path:
-    """Find repository root by looking for .git directory."""
-    current = start.resolve()
-    while current != current.parent:
-        if (current / ".git").exists():
-            return current
-        current = current.parent
-    return start.resolve()
-
-
 async def _ensure_indexed(indexer: Indexer, storage: Storage) -> str:
     """Ensure the repository is indexed. Returns index_status."""
     # Check if index has any data
@@ -92,7 +82,9 @@ async def _ensure_indexed(indexer: Indexer, storage: Storage) -> str:
     description=(
         "Search code by natural language query. Returns semantically relevant "
         "code chunks ranked by similarity. USE INSTEAD OF Grep for code exploration. "
-        "Supports filters: filter_ext (e.g., '.py'), filter_path (e.g., 'src/')."
+        "Supports filters: filter_ext (e.g., '.py'), filter_path (e.g., 'src/'). "
+        "Alias: file_filter — if starts with '.' or '*.' it maps to filter_ext, "
+        "otherwise to filter_path."
     )
 )
 async def search_semantic(
@@ -100,11 +92,19 @@ async def search_semantic(
     top_k: int = 5,
     filter_ext: str | None = None,
     filter_path: str | None = None,
+    file_filter: str | None = None,
 ) -> str:
     """Search code semantically and return ranked results with token savings."""
     try:
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
+
+        # Resolve file_filter alias
+        if file_filter is not None:
+            if file_filter.startswith(".") or file_filter.startswith("*."):
+                filter_ext = filter_ext or file_filter.lstrip("*")
+            else:
+                filter_path = filter_path or file_filter
 
         # Auto-index if needed
         index_status = await _ensure_indexed(indexer, storage)
@@ -117,9 +117,13 @@ async def search_semantic(
             query_vector, top_k=top_k, filter_ext=filter_ext, filter_path=filter_path
         )
 
-        # Build results with stale check
+        # Build results with stale check; apply score_threshold filter
         results = []
         for r in raw_results:
+            score = round(1.0 - r.get("_distance", 0.0), 4)
+            if score < config.score_threshold:
+                continue
+
             fp = r.get("file_path", "")
             file_hash = r.get("file_hash", "")
             stale = storage.is_stale(fp, file_hash) if fp and file_hash else False
@@ -131,9 +135,10 @@ async def search_semantic(
                 "line_start": r.get("line_start", 0),
                 "line_end": r.get("line_end", 0),
                 "content": r.get("content", ""),
-                "score": round(1.0 - r.get("_distance", 0.0), 4),
+                "score": score,
                 "language": r.get("language", ""),
                 "stale": stale,
+                "parent_name": r.get("parent_name", ""),
             })
 
         # Calculate token savings (persists cumulative metrics)
@@ -210,7 +215,9 @@ async def reindex(force: bool = False) -> str:
     description=(
         "Search code by exact name (function, class, variable). Returns enriched "
         "chunks via full-text search. USE INSTEAD OF Grep for exact name lookups. "
-        "Supports filters: filter_ext (e.g., '.dart'), filter_path (e.g., 'src/')."
+        "Supports filters: filter_ext (e.g., '.dart'), filter_path (e.g., 'src/'). "
+        "Alias: file_filter — if starts with '.' or '*.' it maps to filter_ext, "
+        "otherwise to filter_path."
     )
 )
 async def search_exact(
@@ -218,11 +225,19 @@ async def search_exact(
     top_k: int = 5,
     filter_ext: str | None = None,
     filter_path: str | None = None,
+    file_filter: str | None = None,
 ) -> str:
     """Search code by exact name via FTS (no embedding needed)."""
     try:
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
+
+        # Resolve file_filter alias
+        if file_filter is not None:
+            if file_filter.startswith(".") or file_filter.startswith("*."):
+                filter_ext = filter_ext or file_filter.lstrip("*")
+            else:
+                filter_path = filter_path or file_filter
 
         # Auto-index if needed
         index_status = await _ensure_indexed(indexer, storage)
@@ -232,9 +247,13 @@ async def search_exact(
             query, top_k=top_k, filter_ext=filter_ext, filter_path=filter_path
         )
 
-        # Build results with stale check
+        # Build results with stale check; apply score_threshold filter
         results = []
         for r in raw_results:
+            score = r.get("_score", r.get("score", 0.0))
+            if score < config.score_threshold:
+                continue
+
             fp = r.get("file_path", "")
             file_hash = r.get("file_hash", "")
             stale = storage.is_stale(fp, file_hash) if fp and file_hash else False
@@ -246,7 +265,7 @@ async def search_exact(
                 "line_start": r.get("line_start", 0),
                 "line_end": r.get("line_end", 0),
                 "content": r.get("content", ""),
-                "score": r.get("_score", r.get("score", 0.0)),
+                "score": score,
                 "language": r.get("language", ""),
                 "stale": stale,
                 "parent_name": r.get("parent_name", ""),
@@ -412,8 +431,6 @@ def _current_file_hash(file_path: str, repo_path: Path | None) -> str:
 async def get_file(file_path: str) -> str:
     """Read a file indexed chunks organized by type with stale detection and token savings."""
     try:
-        import hashlib as _hashlib
-
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
 
@@ -439,7 +456,7 @@ async def get_file(file_path: str) -> str:
             })
 
         try:
-            current_hash = _hashlib.sha256(full_path.read_bytes()).hexdigest()
+            current_hash = _compute_file_hash(full_path)
         except Exception:
             current_hash = ""
 
@@ -475,6 +492,7 @@ async def get_file(file_path: str) -> str:
         tokens_saved = calculate_savings(
             [{"file_path": str(full_path), "content": r["content"]} for r in results],
             None,  # file_path is already absolute
+            index_path=storage.index_path,
         )
 
         query_time_ms = int((time.perf_counter() - start) * 1000)
@@ -509,7 +527,9 @@ async def get_file(file_path: str) -> str:
         "name/token matches in one query. Returns merged, de-duplicated results "
         "ranked by combined relevance score. USE INSTEAD OF running search_semantic "
         "and search_exact separately. "
-        "Supports filters: filter_ext (e.g., '.py'), filter_path (e.g., 'src/')."
+        "Supports filters: filter_ext (e.g., '.py'), filter_path (e.g., 'src/'). "
+        "Alias: file_filter — if starts with '.' or '*.' it maps to filter_ext, "
+        "otherwise to filter_path."
     )
 )
 async def search_hybrid(
@@ -517,11 +537,19 @@ async def search_hybrid(
     top_k: int = 5,
     filter_ext: str | None = None,
     filter_path: str | None = None,
+    file_filter: str | None = None,
 ) -> str:
     """Combine vector search and FTS, merge and de-duplicate results."""
     try:
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
+
+        # Resolve file_filter alias
+        if file_filter is not None:
+            if file_filter.startswith(".") or file_filter.startswith("*."):
+                filter_ext = filter_ext or file_filter.lstrip("*")
+            else:
+                filter_path = filter_path or file_filter
 
         # Auto-index if needed
         index_status = await _ensure_indexed(indexer, storage)
@@ -540,7 +568,7 @@ async def search_hybrid(
                 query, top_k=fetch_k, filter_ext=filter_ext, filter_path=filter_path
             )
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         vector_raw, fts_raw = await asyncio.gather(
             loop.run_in_executor(None, _run_vector),
             loop.run_in_executor(None, _run_fts),
@@ -594,11 +622,12 @@ async def search_hybrid(
                 "score": combined_score,
                 "language": rec.get("language", ""),
                 "stale": stale,
+                "parent_name": rec.get("parent_name", ""),
             })
 
-        # Sort by combined score descending and limit to top_k
+        # Sort by combined score descending, apply score_threshold, and limit to top_k
         merged.sort(key=lambda x: x["score"], reverse=True)
-        results = merged[:top_k]
+        results = [r for r in merged if r["score"] >= config.score_threshold][:top_k]
 
         tokens_saved = calculate_savings(results, repo_path, index_path=storage.index_path)
         query_time_ms = int((time.perf_counter() - start) * 1000)
@@ -654,7 +683,7 @@ async def audit_search(query: str) -> str:
         def _run_fts():
             return storage.search_fts(query, top_k=fetch_k)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         vector_raw, fts_raw = await asyncio.gather(
             loop.run_in_executor(None, _run_vector),
             loop.run_in_executor(None, _run_fts),
@@ -685,11 +714,6 @@ async def audit_search(query: str) -> str:
         grep_only = [fts_map[k] for k in grep_only_keys]
         both = [vec_map[k] for k in both_keys]
 
-        # tokens_saved: semantic approach (only chunks) vs grep approach (full files)
-        all_semantic_results = [
-            {"file_path": r["file_path"], "content": v.get("content", "")}
-            for r, v in zip(vector_raw, vector_raw)
-        ]
         tokens_saved = calculate_savings(
             [{"file_path": r.get("file_path", ""), "content": r.get("content", "")} for r in vector_raw],
             repo_path,
@@ -746,3 +770,7 @@ def _error_suggestion(error: CTSError) -> str:
     elif isinstance(error, ConfigValidationError):
         return "Check your config at ~/.claude-token-saver/config.yaml"
     return "Check plugin configuration and try again."
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
