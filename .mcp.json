@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "claude-token-saver": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "${CLAUDE_PLUGIN_DATA}/claude-token-saver",
+        "run",
+        "python",
+        "-m",
+        "src.server"
+      ],
+      "env": {
+        "PLUGIN_DATA_DIR": "${CLAUDE_PLUGIN_DATA}/claude-token-saver"
+      }
+    }
+  }
+}
