@@ -1,7 +1,7 @@
 {
   "name": "claude-token-saver",
   "version": "0.1.0",
-  "author": "breaktapps",
+  "author": { "name": "BreaktApps" },
   "description": "Semantic code search MCP plugin for Claude Code. Reduces token consumption by 70-90% during code exploration by replacing grep/cat cascading with vector search that returns only relevant chunks.",
   "homepage": "https://github.com/breaktapps/claude-token-saver",
   "license": "MIT",
