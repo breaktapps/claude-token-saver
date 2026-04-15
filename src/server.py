@@ -78,44 +78,26 @@ def _init_components() -> tuple:
     return _config, _storage, _indexer, _embed_provider, _repo_path
 
 
-async def _ensure_indexed(indexer: Indexer, storage: Storage) -> str:
-    """Ensure the repository is indexed. Returns index_status with progress info."""
-    # Check if index has any data
+async def _ensure_indexed(indexer: Indexer, storage: Storage) -> dict:
+    """Ensure the repository is indexed. Returns dict with status and notice."""
     hashes = storage.get_file_hashes()
     if hashes:
-        return "ready"
+        return {"status": "ready", "notice": None}
 
-    # First-time indexation — log progress for visibility
-    logger.info(
-        "First-time indexation starting for %s. "
-        "This may take 30-60s for large repositories.",
-        indexer.repo_path,
+    # First-time indexation
+    logger.info("First-time indexation starting for %s", indexer.repo_path)
+
+    stats = await indexer.reindex(force=False)
+
+    notice = (
+        f"First-time index complete: {stats.get('files_scanned', 0)} files scanned, "
+        f"{stats.get('chunks_created', 0)} chunks created in "
+        f"{stats.get('duration_ms', 0) / 1000:.1f}s. "
+        f"Subsequent searches will be fast (<500ms)."
     )
+    logger.info(notice)
 
-    progress_log = []
-
-    def _on_progress(stage, current, total, detail):
-        if stage == "scanning" and current == total and total > 0:
-            msg = f"[claude-token-saver] Scanning complete: {total} files found"
-            logger.info(msg)
-            progress_log.append(msg)
-        elif stage == "chunking" and total > 0 and (current == total or current % 50 == 0):
-            pct = int(current / total * 100)
-            msg = f"[claude-token-saver] Chunking: {current}/{total} files ({pct}%)"
-            logger.info(msg)
-            progress_log.append(msg)
-        elif stage == "embedding" and total > 0:
-            pct = int(current / total * 100)
-            msg = f"[claude-token-saver] Embedding: {current}/{total} chunks ({pct}%)"
-            logger.info(msg)
-            progress_log.append(msg)
-        elif stage == "done":
-            msg = f"[claude-token-saver] Indexation complete: {detail}"
-            logger.info(msg)
-            progress_log.append(msg)
-
-    await indexer.reindex(force=False, progress_callback=_on_progress)
-    return "first_index"
+    return {"status": "first_index", "notice": notice}
 
 
 @mcp.tool(
@@ -152,7 +134,8 @@ async def search_semantic(
                 filter_path = filter_path or file_filter
 
         # Auto-index if needed
-        index_status = await _ensure_indexed(indexer, storage)
+        _idx = await _ensure_indexed(indexer, storage)
+        index_status = _idx["status"]
 
         # Embed the query
         query_vector = embed_provider.embed_query(query)
@@ -198,6 +181,7 @@ async def search_semantic(
             "metadata": {
                 "query_time_ms": query_time_ms,
                 "index_status": index_status,
+                "notice": _idx.get("notice"),
             },
         }
 
@@ -300,7 +284,8 @@ async def search_exact(
                 filter_path = filter_path or file_filter
 
         # Auto-index if needed
-        index_status = await _ensure_indexed(indexer, storage)
+        _idx = await _ensure_indexed(indexer, storage)
+        index_status = _idx["status"]
 
         # FTS search -- no embedding
         raw_results = storage.search_fts(
@@ -347,6 +332,7 @@ async def search_exact(
             "metadata": {
                 "query_time_ms": query_time_ms,
                 "index_status": index_status,
+                "notice": _idx.get("notice"),
             },
         }
 
@@ -502,7 +488,8 @@ async def get_file(file_path: str) -> str:
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
 
-        index_status = await _ensure_indexed(indexer, storage)
+        _idx = await _ensure_indexed(indexer, storage)
+        index_status = _idx["status"]
 
         # Try relative path first (indexer stores relative paths)
         raw_chunks = storage.get_chunks_by_file(file_path)
@@ -572,6 +559,7 @@ async def get_file(file_path: str) -> str:
             "metadata": {
                 "query_time_ms": query_time_ms,
                 "index_status": index_status,
+                "notice": _idx.get("notice"),
             },
         }
 
@@ -626,7 +614,8 @@ async def search_hybrid(
                 filter_path = filter_path or file_filter
 
         # Auto-index if needed
-        index_status = await _ensure_indexed(indexer, storage)
+        _idx = await _ensure_indexed(indexer, storage)
+        index_status = _idx["status"]
 
         # Run both branches in parallel; fetch top_k*2 to allow for overlap
         fetch_k = top_k * 2
@@ -714,6 +703,7 @@ async def search_hybrid(
             "metadata": {
                 "query_time_ms": query_time_ms,
                 "index_status": index_status,
+                "notice": _idx.get("notice"),
             },
         }
 
@@ -754,7 +744,8 @@ async def audit_search(query: str, top_k: int = 10) -> str:
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
 
-        index_status = await _ensure_indexed(indexer, storage)
+        _idx = await _ensure_indexed(indexer, storage)
+        index_status = _idx["status"]
 
         fetch_k = top_k
 
@@ -825,6 +816,7 @@ async def audit_search(query: str, top_k: int = 10) -> str:
             "metadata": {
                 "query_time_ms": query_time_ms,
                 "index_status": index_status,
+                "notice": _idx.get("notice"),
             },
         }
 
