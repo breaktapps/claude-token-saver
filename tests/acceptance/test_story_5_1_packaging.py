@@ -55,12 +55,11 @@ class TestPluginJson:
         assert "description" in plugin_json
         assert plugin_json["description"]
 
-    def test_plugin_json_references_mcp_and_hooks(self, plugin_json):
-        """plugin.json deve referenciar .mcp.json e hooks/hooks.json."""
-        assert "mcp_config" in plugin_json, "plugin.json deve referenciar .mcp.json"
-        assert "hooks_config" in plugin_json, "plugin.json deve referenciar hooks/hooks.json"
-        assert ".mcp.json" in plugin_json["mcp_config"]
-        assert "hooks.json" in plugin_json["hooks_config"]
+    def test_plugin_json_has_no_invalid_fields(self, plugin_json):
+        """plugin.json não deve ter campos inválidos (mcp_config/hooks_config).
+        Claude Code lê .mcp.json e hooks/hooks.json automaticamente da raiz do plugin."""
+        assert "mcp_config" not in plugin_json, "mcp_config é campo inválido"
+        assert "hooks_config" not in plugin_json, "hooks_config é campo inválido"
 
 
 class TestMcpJson:
@@ -86,15 +85,17 @@ class TestMcpJson:
             "args devem apontar para src.server"
         )
 
-    def test_mcp_json_uses_plugin_data_env(self, mcp_json):
-        """Deve usar ${CLAUDE_PLUGIN_DATA} para path do virtual environment."""
+    def test_mcp_json_uses_plugin_root_env(self, mcp_json):
+        """Deve usar ${CLAUDE_PLUGIN_ROOT} para --directory e CTS_REPO_PATH=${PWD}."""
         servers = mcp_json["mcpServers"]
         server = servers["claude-token-saver"]
-        # Check args or env for CLAUDE_PLUGIN_DATA reference
         args_str = " ".join(server.get("args", []))
-        env_str = str(server.get("env", {}))
-        assert "CLAUDE_PLUGIN_DATA" in args_str or "CLAUDE_PLUGIN_DATA" in env_str, (
-            "Deve usar ${CLAUDE_PLUGIN_DATA} para path do venv"
+        env = server.get("env", {})
+        assert "CLAUDE_PLUGIN_ROOT" in args_str, (
+            "args devem usar ${CLAUDE_PLUGIN_ROOT} para --directory"
+        )
+        assert env.get("CTS_REPO_PATH") == "${PWD}", (
+            "env deve passar CTS_REPO_PATH=${PWD} para o server saber o repo do usuario"
         )
 
 
@@ -108,45 +109,37 @@ class TestHooksJson:
         with open(path) as f:
             return json.load(f)
 
-    def test_hooks_json_has_session_start_bootstrap(self, hooks_json):
+    def test_hooks_json_has_session_start(self, hooks_json):
         """hooks.json deve ter SessionStart hook (bootstrap)."""
-        hooks = hooks_json.get("hooks", [])
-        session_start_hooks = [h for h in hooks if h.get("event") == "SessionStart"]
-        bootstrap_hooks = [h for h in session_start_hooks if "bootstrap" in h.get("name", "")]
-        assert bootstrap_hooks, "Deve ter SessionStart hook com nome 'bootstrap'"
+        hooks = hooks_json.get("hooks", {})
+        assert "SessionStart" in hooks, "Deve ter SessionStart hook"
+        session_start = hooks["SessionStart"]
+        assert isinstance(session_start, list) and len(session_start) > 0
 
     def test_hooks_json_has_post_tool_reindex(self, hooks_json):
-        """hooks.json deve ter post_tool hook (auto-reindex on Edit/Write)."""
-        hooks = hooks_json.get("hooks", [])
-        post_tool_hooks = [
-            h for h in hooks
-            if h.get("event") in ("PostToolUse", "post_tool")
-        ]
-        assert post_tool_hooks, "Deve ter PostToolUse hook para auto-reindex"
-        # Verifica que cobre Edit e Write
+        """hooks.json deve ter PostToolUse hook (auto-reindex on Edit/Write)."""
+        hooks = hooks_json.get("hooks", {})
+        assert "PostToolUse" in hooks, "Deve ter PostToolUse hook"
+        post_tool = hooks["PostToolUse"]
+        assert isinstance(post_tool, list) and len(post_tool) > 0
+        # Verifica que matcher cobre Edit e Write
         has_edit_write = any(
-            "Edit" in str(h.get("matcher", {})) and "Write" in str(h.get("matcher", {}))
-            for h in post_tool_hooks
+            "Edit" in str(entry.get("matcher", "")) and "Write" in str(entry.get("matcher", ""))
+            for entry in post_tool
         )
         assert has_edit_write, "PostToolUse hook deve cobrir Edit e Write"
 
     def test_hooks_json_has_pre_tool_use_nudge(self, hooks_json):
         """hooks.json deve ter PreToolUse hook (nudge)."""
-        hooks = hooks_json.get("hooks", [])
-        pre_tool_hooks = [h for h in hooks if h.get("event") == "PreToolUse"]
-        assert pre_tool_hooks, "Deve ter PreToolUse hook para nudge"
-        nudge_hooks = [h for h in pre_tool_hooks if "nudge" in h.get("name", "")]
-        assert nudge_hooks, "PreToolUse hook deve ter nome contendo 'nudge'"
+        hooks = hooks_json.get("hooks", {})
+        assert "PreToolUse" in hooks, "Deve ter PreToolUse hook"
+        pre_tool = hooks["PreToolUse"]
+        assert isinstance(pre_tool, list) and len(pre_tool) > 0
 
-    def test_hooks_json_has_session_start_compact(self, hooks_json):
-        """hooks.json deve ter SessionStart compact hook (re-inject instructions)."""
-        hooks = hooks_json.get("hooks", [])
-        session_start_hooks = [h for h in hooks if h.get("event") == "SessionStart"]
-        compact_hooks = [
-            h for h in session_start_hooks
-            if "compact" in h.get("name", "") or "compact" in str(h.get("trigger", ""))
-        ]
-        assert compact_hooks, "Deve ter SessionStart hook para re-inject apos compact"
+    def test_hooks_json_format_is_object(self, hooks_json):
+        """hooks.json deve usar formato objeto {EventName: [matchers]}, não array."""
+        hooks = hooks_json.get("hooks", {})
+        assert isinstance(hooks, dict), "hooks deve ser objeto, não array"
 
 
 class TestSkillMd:

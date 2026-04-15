@@ -10,7 +10,9 @@
         "-m",
         "src.server"
       ],
-      "env": {}
+      "env": {
+        "CTS_REPO_PATH": "${PWD}"
+      }
     }
   }
 }

@@ -62,7 +62,14 @@ def _init_components() -> tuple:
         return _config, _storage, _indexer, _embed_provider, _repo_path
 
     _config = Config.load()
-    _repo_path = _find_repo_root(Path.cwd())
+    # CTS_REPO_PATH is injected by .mcp.json from Claude Code's PWD
+    env_repo = os.environ.get("CTS_REPO_PATH")
+    if env_repo:
+        _repo_path = Path(env_repo)
+        logger.info("Repo path from CTS_REPO_PATH: %s", _repo_path)
+    else:
+        _repo_path = _find_repo_root(Path.cwd())
+        logger.info("Repo path from cwd: %s", _repo_path)
     _storage = Storage(_config, _repo_path)
     _embed_provider = create_embedding_provider(_config)
     _indexer = Indexer(_config, _storage, _embed_provider, repo_path=_repo_path)
