@@ -9,12 +9,15 @@ Persists cumulative totals to metrics.json in the index directory.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger("cts.metrics")
 
 # Per-index-path locks for thread-safe read-modify-write
 _metrics_locks: dict[str, threading.Lock] = {}
@@ -144,6 +147,7 @@ def _save_metrics(index_path: Path, data: dict) -> None:
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp_path, str(metrics_file))
+        logger.debug("Saved metrics to %s", metrics_file)
     except Exception:
         try:
             os.unlink(tmp_path)

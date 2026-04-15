@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+
+logger = logging.getLogger("cts.server")
 
 from .config import Config
 from .embeddings import create_embedding_provider
@@ -96,6 +99,11 @@ async def search_semantic(
 ) -> str:
     """Search code semantically and return ranked results with token savings."""
     try:
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            return json.dumps({"error": "top_k must be an integer", "suggestion": "Pass top_k as an integer (e.g., top_k=5)"})
+
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
 
@@ -145,6 +153,7 @@ async def search_semantic(
         tokens_saved = calculate_savings(results, repo_path, index_path=storage.index_path)
 
         query_time_ms = int((time.perf_counter() - start) * 1000)
+        logger.info("search_semantic: query=%r, results=%d, time=%dms", query, len(results), query_time_ms)
 
         response = {
             "results": results,
@@ -186,6 +195,15 @@ async def reindex(force: bool = False) -> str:
         stats = await indexer.reindex(force=force)
 
         index_status = "rebuilt" if force else "updated"
+        logger.info(
+            "reindex: force=%s, scanned=%d, updated=%d, added=%d, deleted=%d, time=%dms",
+            force,
+            stats["files_scanned"],
+            stats.get("files_updated", 0),
+            stats.get("files_added", 0),
+            stats.get("files_deleted", 0),
+            stats["duration_ms"],
+        )
 
         return json.dumps({
             "files_scanned": stats["files_scanned"],
@@ -229,6 +247,11 @@ async def search_exact(
 ) -> str:
     """Search code by exact name via FTS (no embedding needed)."""
     try:
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            return json.dumps({"error": "top_k must be an integer", "suggestion": "Pass top_k as an integer (e.g., top_k=5)"})
+
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
 
@@ -279,6 +302,7 @@ async def search_exact(
         tokens_saved = calculate_savings(results, repo_path, index_path=storage.index_path)
 
         query_time_ms = int((time.perf_counter() - start) * 1000)
+        logger.info("search_exact: query=%r, results=%d, time=%dms", query, len(results), query_time_ms)
 
         response = {
             "results": results,
@@ -372,13 +396,20 @@ async def inspect_index(file_path: str | None = None) -> str:
         tokens_saved_total = metrics.get("total_saved", 0)
         total_queries = metrics.get("total_queries", 0)
 
-        # Stale files: compute current on-disk hash and compare against stored hash
+        # Stale files: load all stored hashes in one query, then compare on-disk hashes in memory
+        stored_hashes = storage.get_file_hashes()
         stale_files: list[str] = []
         for fp in unique_files:
             current_hash = _current_file_hash(fp, repo_path)
-            if storage.is_stale(fp, current_hash):
+            if stored_hashes.get(fp, "") != current_hash:
                 stale_files.append(fp)
 
+        logger.info(
+            "inspect_index: total_files=%d, total_chunks=%d, stale=%d",
+            total_files,
+            total_chunks,
+            len(stale_files),
+        )
         return json.dumps({
             "total_files": total_files,
             "total_chunks": total_chunks,
@@ -496,6 +527,7 @@ async def get_file(file_path: str) -> str:
         )
 
         query_time_ms = int((time.perf_counter() - start) * 1000)
+        logger.info("get_file: path=%r, chunks=%d, time=%dms", file_path, len(results), query_time_ms)
 
         response = {
             "results": results,
@@ -541,6 +573,11 @@ async def search_hybrid(
 ) -> str:
     """Combine vector search and FTS, merge and de-duplicate results."""
     try:
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            return json.dumps({"error": "top_k must be an integer", "suggestion": "Pass top_k as an integer (e.g., top_k=5)"})
+
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
 
@@ -600,7 +637,8 @@ async def search_hybrid(
             if in_vec and in_fts:
                 rec, v_score = vec_map[key]
                 _, f_score = fts_map[key]
-                combined_score = round(max(v_score, f_score) * 1.2, 4)
+                # 1.2x boost for items found by both methods; capped at 1.0
+                combined_score = round(min(max(v_score, f_score) * 1.2, 1.0), 4)
             elif in_vec:
                 rec, v_score = vec_map[key]
                 combined_score = v_score
@@ -631,6 +669,7 @@ async def search_hybrid(
 
         tokens_saved = calculate_savings(results, repo_path, index_path=storage.index_path)
         query_time_ms = int((time.perf_counter() - start) * 1000)
+        logger.info("search_hybrid: query=%r, results=%d, time=%dms", query, len(results), query_time_ms)
 
         response = {
             "results": results,
@@ -663,18 +702,24 @@ async def search_hybrid(
         "'grep_only' (found by grep but not vector), "
         "'both' (found by both). "
         "Use to validate plugin coverage, find semantic gaps, and compare approaches. "
+        "Parameter: top_k (default 10) — how many results to fetch per method. "
         "Includes match counts per category and tokens_saved comparison."
     )
 )
-async def audit_search(query: str) -> str:
+async def audit_search(query: str, top_k: int = 10) -> str:
     """Compare semantic search vs FTS (grep-equivalent), categorize results."""
     try:
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            return json.dumps({"error": "top_k must be an integer", "suggestion": "Pass top_k as an integer (e.g., top_k=10)"})
+
         start = time.perf_counter()
         config, storage, indexer, embed_provider, repo_path = _init_components()
 
         index_status = await _ensure_indexed(indexer, storage)
 
-        fetch_k = 20  # fixed fetch size for audit
+        fetch_k = top_k
 
         def _run_vector():
             query_vector = embed_provider.embed_query(query)
@@ -721,6 +766,14 @@ async def audit_search(query: str) -> str:
         )
 
         query_time_ms = int((time.perf_counter() - start) * 1000)
+        logger.info(
+            "audit_search: query=%r, both=%d, semantic_only=%d, grep_only=%d, time=%dms",
+            query,
+            len(both),
+            len(semantic_only),
+            len(grep_only),
+            query_time_ms,
+        )
 
         response = {
             "semantic_only": semantic_only,

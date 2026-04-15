@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import logging
 import os
 import time
 from contextlib import contextmanager
@@ -18,13 +19,10 @@ import lancedb
 import pyarrow as pa
 
 from .config import Config
+from .embeddings import LITE_DIMENSION, QUALITY_DIMENSION
 from .errors import LockTimeoutError
 
-# Embedding dimensions by mode
-EMBEDDING_DIMS = {
-    "lite": 384,
-    "quality": 1024,
-}
+logger = logging.getLogger("cts.storage")
 
 # Default lock timeout in seconds
 LOCK_TIMEOUT = 10
@@ -92,7 +90,8 @@ class Storage:
         self._index_path.mkdir(parents=True, exist_ok=True)
         self._lock_path = self._index_path / "index.lock"
 
-        dim = EMBEDDING_DIMS.get(config.embedding_mode, 384)
+        _EMBEDDING_DIMS = {"lite": LITE_DIMENSION, "quality": QUALITY_DIMENSION}
+        dim = _EMBEDDING_DIMS.get(config.embedding_mode, LITE_DIMENSION)
         self._schema = _build_schema(dim)
         self._dim = dim
 
@@ -159,10 +158,12 @@ class Storage:
                             "Another operation may be in progress."
                         )
                     time.sleep(LOCK_POLL_INTERVAL)
+            logger.debug("Acquired lock")
             try:
                 yield
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
+                logger.debug("Released lock")
         finally:
             os.close(fd)
 
@@ -193,6 +194,7 @@ class Storage:
 
             batch = pa.table(arrays, schema=self._schema)
             table.add(batch)
+            logger.info("Upserted %d chunks for %d file(s)", len(chunks), len(file_paths))
 
             # Recreate FTS index after data changes
             self._fts_created = False
@@ -286,6 +288,7 @@ class Storage:
         """Return mapping of file_path -> file_hash for all indexed files."""
         table = self._get_or_create_table()
         try:
+            # Full scan intentional — needed for complete stale detection
             results = table.search().select(["file_path", "file_hash"]).to_list()
         except Exception:
             return {}
@@ -302,6 +305,7 @@ class Storage:
         """Return minimal metadata for all chunks: file_path, file_hash, language, chunk_type."""
         table = self._get_or_create_table()
         try:
+            # Full scan intentional — needed for complete stale detection
             results = table.search().select(["file_path", "file_hash", "language", "chunk_type"]).to_list()
         except Exception:
             return []

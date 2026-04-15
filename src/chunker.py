@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from typing import Any
 from tree_sitter import Language, Node, Parser
 
 from .config import Config
+
+logger = logging.getLogger("cts.chunker")
 
 # Language extension mapping
 _EXTENSION_MAP: dict[str, str] = {
@@ -135,6 +138,7 @@ def parse(
         return []
 
     rel_path = str(file_path)
+    logger.debug("Parsing %s (%s)", file_path, language)
 
     if language == "dart":
         return _parse_dart(source, rel_path, max_chunk_lines)

@@ -6,6 +6,7 @@ Config is immutable after load.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -14,6 +15,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict
 
 from .errors import ConfigValidationError
+
+logger = logging.getLogger("cts.config")
 
 # Defaults
 DEFAULT_EMBEDDING_MODE = "lite"
@@ -24,7 +27,9 @@ DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_CHUNK_LINES = 150
 
 # API key patterns that must never appear as literal values in YAML
-_API_KEY_PATTERNS = re.compile(r"^(sk-|voy-|key-|gsk_)")
+# Covers: OpenAI (sk-), Anthropic (sk-ant-), Voyage (voy-), generic (key-),
+#         Google/Gemini (gsk_), Cohere (co-)
+_API_KEY_PATTERNS = re.compile(r"^(sk-|sk-ant-|voy-|key-|gsk_|co-)")
 
 # Default config path
 CONFIG_PATH = Path.home() / ".claude-token-saver" / "config.yaml"
@@ -143,4 +148,11 @@ class Config(BaseModel):
         # Apply env var overrides on top
         final_overrides = _apply_env_vars(yaml_overrides)
 
-        return cls(**final_overrides)
+        cfg = cls(**final_overrides)
+        logger.info(
+            "Config loaded: embedding_mode=%s, embedding_provider=%s, top_k=%d",
+            cfg.embedding_mode,
+            cfg.embedding_provider,
+            cfg.top_k,
+        )
+        return cfg

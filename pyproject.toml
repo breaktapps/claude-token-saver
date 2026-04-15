@@ -22,3 +22,10 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "benchmark: testes de performance (NFR). Rodar com: pytest -m benchmark",
+    "slow: testes demorados (ex: NFR3 com 500 arquivos). Excluídos do CI padrão",
+]

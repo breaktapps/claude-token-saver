@@ -17,10 +17,11 @@ import pytest
 
 from src.config import Config
 from src.errors import LockTimeoutError
-from src.storage import Storage, get_index_path, _compute_repo_hash, EMBEDDING_DIMS
+from src.embeddings import LITE_DIMENSION
+from src.storage import Storage, get_index_path, _compute_repo_hash
 
 
-DIM = EMBEDDING_DIMS["lite"]  # 384
+DIM = LITE_DIMENSION  # 384
 
 
 def _random_vector(dim: int = DIM, seed: int | None = None) -> list[float]:

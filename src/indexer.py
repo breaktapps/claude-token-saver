@@ -7,8 +7,11 @@ The Indexer is a facade that coordinates chunker, embeddings, and storage.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from pathlib import Path
+
+logger = logging.getLogger("cts.indexer")
 
 from .chunker import detect_language, parse, scan_files
 from .config import Config
@@ -157,6 +160,16 @@ class Indexer:
             self._storage.upsert(all_chunks)
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
+
+        logger.info(
+            "Reindex: %d scanned, %d updated, %d added, %d deleted, %d chunks in %dms",
+            len(files),
+            len(modified),
+            len(new_files),
+            len(deleted),
+            len(all_chunks),
+            duration_ms,
+        )
 
         return {
             "files_scanned": len(files),

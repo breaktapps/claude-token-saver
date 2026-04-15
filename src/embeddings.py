@@ -9,6 +9,7 @@ BYOK providers (Voyage, OpenAI, Ollama) configured via env vars:
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -16,6 +17,8 @@ from typing import Any
 
 from .config import Config
 from .errors import EmbeddingProviderError
+
+logger = logging.getLogger("cts.embeddings")
 
 # Model constants
 LITE_MODEL = "BAAI/bge-small-en-v1.5"
@@ -57,6 +60,7 @@ class EmbeddingProvider(ABC):
     def embed_query(self, query: str) -> list[float]:
         """Embed a single query with LRU cache (shared across all providers)."""
         if query in self._cache:
+            logger.debug("Cache hit for query")
             self._cache.move_to_end(query)
             return self._cache[query]
 
@@ -321,15 +325,18 @@ def create_embedding_provider(config: Config) -> EmbeddingProvider:
     provider = config.embedding_provider
 
     if provider == "local":
-        return LocalFastembedProvider(config)
+        instance = LocalFastembedProvider(config)
     elif provider == "voyage":
-        return VoyageProvider(config)
+        instance = VoyageProvider(config)
     elif provider == "openai":
-        return OpenAIProvider(config)
+        instance = OpenAIProvider(config)
     elif provider == "ollama":
-        return OllamaProvider(config)
+        instance = OllamaProvider(config)
     else:
         raise EmbeddingProviderError(
             f"Unknown provider '{provider}'. "
             "Supported: 'local', 'voyage', 'openai', 'ollama'."
         )
+
+    logger.info("Initialized %s provider (dim=%d)", provider, instance.dimension())
+    return instance
