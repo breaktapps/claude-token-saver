@@ -30,10 +30,13 @@ When exploring code in a repository that has been indexed by claude-token-saver,
 4. Only use Grep/Read/Bash for file system operations, not code exploration
 
 ### Token savings reporting:
-- **ALWAYS** show the `tokens_saved` info to the user after each search/get_file call
-- Format: "Tokens saved: X (Y% reduction)" — e.g. "Tokens saved: 4,831 (74.9% reduction)"
-- This is the plugin's core value proposition — the user needs to see the savings to justify the plugin
+- **ALWAYS** show token savings to the user after each search/get_file call
+- Show BOTH the per-call savings AND the session cumulative total
+- Format: "Tokens saved: X (Y% reduction) | Session total: Z tokens saved"
+- Keep a running total across all plugin tool calls in the conversation
+- Example after 3 calls: "Tokens saved: 2,100 (81%) | Session total: 8,932 tokens saved"
 - The `tokens_saved` object is in every tool response: `{without_plugin, with_plugin, saved, reduction_pct}`
+- This is the plugin's core value proposition — the user needs to see the cumulative impact
 
 ### Token savings target:
 - Each semantic search call saves ~70-90% tokens vs grep/cat cascade

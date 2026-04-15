@@ -36,7 +36,8 @@ This project has the claude-token-saver plugin installed. **Always prefer plugin
 - Use **search_hybrid** when you want maximum recall
 - Use **get_file** instead of Read for code files
 - Only fall back to native tools for non-code files (configs, images, etc.)
-- **ALWAYS show token savings** to the user after each search: "Tokens saved: X (Y% reduction)"
+- **ALWAYS show token savings** after each search: "Tokens saved: X (Y%) | Session total: Z saved"
+- Keep a running total of tokens saved across all plugin calls in this conversation
 $MARKER"
 
 # Append to CLAUDE.md (create if doesn't exist)
