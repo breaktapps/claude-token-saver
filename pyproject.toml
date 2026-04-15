@@ -15,6 +15,7 @@ dependencies = [
     "tree-sitter-javascript>=0.25.0",
     "tree-sitter-python>=0.25.0",
     "tree-sitter-typescript>=0.23.2",
+    "tree-sitter-dart @ git+https://github.com/UserNobody14/tree-sitter-dart.git",
 ]
 
 [dependency-groups]
