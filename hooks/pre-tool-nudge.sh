@@ -38,9 +38,13 @@ fi
 # Determine which tool triggered this hook
 TOOL_NAME="${CLAUDE_TOOL_NAME:-}"
 
-GREP_NUDGE="This project has a semantic code index (claude-token-saver). Consider using search_semantic(query) for natural language search or search_exact(query) for exact name lookup instead of Grep. The index provides richer results with token savings of 70-90%."
+GREP_NUDGE="This project has a semantic code index (claude-token-saver). Use search_semantic(query) for natural language search or search_exact(query) for exact name lookup instead of Grep. 70-90% token savings."
 
-READ_NUDGE="This file may be indexed by claude-token-saver. Consider using get_file(file_path) for structured reading with class outlines and method details instead of raw Read. This saves tokens and returns only relevant code chunks."
+READ_NUDGE="This file may be indexed by claude-token-saver. Use get_file(file_path) for structured reading with class outlines and method details instead of raw Read."
+
+GLOB_NUDGE="This project has a semantic code index (claude-token-saver). Use search_exact(query) to find functions, classes, or variables by name instead of Glob. Returns enriched results with metadata."
+
+AGENT_NUDGE="This project has a semantic code index (claude-token-saver). Use search_semantic(query) for code exploration instead of spawning an Explore agent. Faster, cheaper, already indexed."
 
 case "$TOOL_NAME" in
     Grep)
@@ -49,15 +53,24 @@ case "$TOOL_NAME" in
     Read)
         echo "$READ_NUDGE"
         ;;
+    Glob)
+        echo "$GLOB_NUDGE"
+        ;;
+    Agent)
+        # Only nudge if it looks like an Explore agent
+        TOOL_INPUT="${CLAUDE_TOOL_INPUT:-}"
+        if echo "$TOOL_INPUT" | grep -qiE 'explore|search|find|where|how'; then
+            echo "$AGENT_NUDGE"
+        fi
+        ;;
     Bash)
-        # Bash is a catch-all — only nudge if input looks like grep/cat
+        # Only nudge if input looks like grep/cat/find
         TOOL_INPUT="${CLAUDE_TOOL_INPUT:-}"
         if echo "$TOOL_INPUT" | grep -qE '^\s*(grep|cat|find|rg|ag)\s'; then
             echo "$GREP_NUDGE"
         fi
         ;;
     *)
-        # No nudge for other tools
         ;;
 esac
 

@@ -32,7 +32,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|Grep|Read",
+        "matcher": "Bash|Grep|Read|Glob|Agent",
         "hooks": [
           {
             "type": "command",
